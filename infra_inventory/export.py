@@ -34,8 +34,7 @@ def write_outputs(
     output: Path,
     summary: RunSummary,
     qc_report: List[dict],
-    points: List[Sequence[float]],
-    point_colors: List[Sequence[float]],
+    viewer: Dict[str, object],
 ) -> None:
     output.mkdir(parents=True, exist_ok=True)
     _ensure_subdirs(output)
@@ -86,8 +85,12 @@ def write_outputs(
     viewer_data = {
         "run": run,
         "assets": inventory,
-        "points": points,
-        "point_colors": point_colors,
+        "points": viewer.get("points", []),
+        "point_colors": viewer.get("point_colors", []),
+        "point_rgb": viewer.get("point_rgb"),
+        "point_intensity": viewer.get("point_intensity"),
+        "point_class": viewer.get("point_class"),
+        "point_class_names": viewer.get("point_class_names", []),
     }
     (output / "viewer-data.json").write_text(json.dumps(viewer_data), encoding="utf-8")
 

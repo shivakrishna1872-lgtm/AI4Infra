@@ -72,7 +72,7 @@ class Asset:
     source_point_source_id: Optional[int] = None
     model_prior_class: Optional[str] = None
     model_confidence: Optional[float] = None
-    processing_version: str = "0.2.0"
+    processing_version: str = "0.3.0"
     geometry: Optional[Dict[str, Any]] = None
     qc_flags: List[str] = field(default_factory=list)
     flagged: bool = False
@@ -94,7 +94,7 @@ class ProcessingSettings:
     chunk_size: int = 500_000
     tile_size_m: float = 40.0
     tile_overlap_m: float = 0.0  # 0 = non-overlapping tiles; instances on boundaries are QC-deduped
-    viewer_point_limit: int = 120_000
+    viewer_point_limit: int = 250_000
     point_index_sample_limit: int = 256
     save_tiles: bool = True
 
@@ -132,13 +132,13 @@ class ProcessingSettings:
     # --- Utilities ---
     pole_min_height_m: float = 2.5
     pole_max_footprint_m: float = 1.35
-    pole_min_columnarity: float = 0.2
+    pole_min_columnarity: float = 0.15
     pole_min_points: int = 40
     pole_resolution_m: float = 0.45
     conductor_min_height_m: float = 4.0
     conductor_min_length_m: float = 8.0
     conductor_max_width_m: float = 0.6
-    conductor_max_height_extent_m: float = 2.5
+    conductor_max_height_extent_m: float = 3.5  # tolerant of pole-attached wires
     conductor_min_points: int = 60
     conductor_resolution_m: float = 0.5
     cabinet_min_height_m: float = 0.4
@@ -211,4 +211,4 @@ class RunSummary:
     scanner_ids: List[int] = field(default_factory=list)
     run_count: int = 0
     elapsed_seconds: float = 0.0
-    processing_version: str = "0.2.0"
+    processing_version: str = "0.3.0"

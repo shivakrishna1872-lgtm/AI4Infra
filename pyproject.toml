@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai4infra"
-version = "0.2.0"
+version = "0.3.0"
 description = "Offline-first LiDAR infrastructure asset inventory pipeline (AI4Infra)"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -13,12 +13,14 @@ authors = [{ name = "AI4Infra" }]
 keywords = ["lidar", "las", "point-cloud", "infrastructure", "asset-inventory", "pointcept", "ptv3"]
 dependencies = [
   "laspy>=2.5",
+  "lazrs>=0.5",
   "numpy>=1.22",
   "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
+server = ["fastapi>=0.110", "uvicorn>=0.29", "python-multipart>=0.0.9"]
 pointcept = ["torch", "torchvision"]  # Pointcept backend; CUDA build required by upstream
 
 [project.scripts]

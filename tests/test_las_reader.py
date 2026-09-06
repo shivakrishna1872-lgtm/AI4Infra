@@ -23,13 +23,13 @@ def test_metadata_las14_format7(synthetic_las: Path) -> None:
 def test_streaming_chunks_preserve_points(synthetic_las: Path) -> None:
     total = 0
     chunks = 0
-    for _, _, chunk in iter_chunks(synthetic_las, chunk_size=10_000):
+    for _, _, chunk in iter_chunks(synthetic_las, chunk_size=4_000):
         total += len(chunk.x)
         chunks += 1
         assert np.isfinite(chunk.x).all()
         assert np.isfinite(chunk.z).all()
     assert total == read_metadata(synthetic_las).point_count
-    assert chunks >= 3  # 28k points / 10k chunk size
+    assert chunks >= 3  # ~10k points / 4k chunk size
 
 
 def test_streaming_chunks_global_offsets(synthetic_las: Path) -> None:

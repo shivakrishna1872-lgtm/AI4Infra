@@ -46,6 +46,7 @@ symbol_max_side_m: 1.5
 # --- Utilities ---
 pole_min_height_m: 2.5
 pole_max_footprint_m: 1.35
+pole_min_columnarity: 0.15
 pole_min_points: 40
 pole_resolution_m: 0.45
 conductor_min_height_m: 4.0

@@ -60,6 +60,17 @@ class MalformedLasError(InfraError):
         )
 
 
+class LazBackendMissingError(InfraError):
+    """Raised when a LAZ (compressed) file is opened without a decompression backend."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "This is a LAZ-compressed point cloud, but no LAZ decoder is installed.",
+            "Install the decoder with `pip install lazrs` (and reinstall laspy) so "
+            "compressed .laz files can be read, then upload the file again.",
+        )
+
+
 class EmptyPointCloudError(InfraError):
     def __init__(self) -> None:
         super().__init__(

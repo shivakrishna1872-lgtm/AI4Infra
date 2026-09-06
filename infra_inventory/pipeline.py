@@ -3,15 +3,16 @@
 Flow (designed for very large mobile-LiDAR clouds):
 
 1. Stream the LAS in chunks; validate; write one LAS file per spatial tile to
-   ``output/tiles/`` (append mode, single pass, bounded memory); sample points
-   and colors for the 3D viewer.
+   ``output/tiles/`` (append mode, single pass, bounded memory); sample points,
+   colors, RGB and intensity for the 3D viewer.
 2. Optional: run Pointcept's real ``tools/test.py`` over the tiles, then load
    the exported per-tile predictions as a *model prior* for detection.
 3. Optional: run the external RoadMarkingExtraction subsystem per tile and
    ingest its DXF vector output.
 4. Process tiles one at a time: ground estimation, geometric features, asset
    detection, attribution, confidence.
-5. Quality control, then export inventory artifacts + viewer.
+5. Quality control, then export inventory artifacts + viewer payload (including
+   per-point class labels derived from the detected assets' source points).
 
 Every asset keeps its source tile, source point indices, CRS, measured
 attributes, and confidence breakdown - nothing is invented.
@@ -22,9 +23,9 @@ import json
 import math
 import shutil
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import laspy
 import numpy as np
@@ -41,7 +42,7 @@ from .roadmarking import run_roadmarking
 from .validation import validate_las
 from .viewer import write_viewer
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 #: Documented adaptation from upstream Pointcept classes to infrastructure
 #: evidence (mirrors configs/model.yaml; used when the YAML is not loaded).
@@ -56,6 +57,9 @@ DEFAULT_CLASS_MAPPING: Dict[str, Dict[str, object]] = {
 
 #: Viewer point colors: elevation gradient (deep blue -> teal -> amber).
 _STOPS = ((0.06, 0.16, 0.38), (0.10, 0.45, 0.55), (0.95, 0.80, 0.42))
+
+#: Stage names reported through the progress callback.
+STAGES = ("validating", "streaming", "pointcept", "roadmarking", "detecting", "exporting", "done")
 
 
 def _elevation_color(z01: np.ndarray) -> List[List[float]]:
@@ -113,7 +117,8 @@ def _append_tile(tiles_dir: Path, tile_name: str, source_header: laspy.LasHeader
 
 def _stream_tiles(
     input_path: Path, output: Path, settings: ProcessingSettings, progress: bool,
-) -> Tuple[RunSummary, List[str], List[List[float]], List[List[float]]]:
+    progress_callback: Optional[Callable[[dict], None]],
+) -> Tuple[RunSummary, List[str], dict]:
     """Pass 1: validate, stream chunks, write tiles, sample viewer data."""
     warnings: List[str] = []
     validation = validate_las(input_path, strict_las14=settings.strict_las14)
@@ -123,8 +128,11 @@ def _stream_tiles(
 
     tiles_dir = output / "tiles"
     tiles_dir.mkdir(parents=True, exist_ok=True)
-    viewer_points: List[List[float]] = []
-    viewer_colors: List[List[float]] = []
+    viewer: dict = {"points": [], "point_colors": [], "point_rgb": None, "point_intensity": None}
+    if metadata.has_rgb:
+        viewer["point_rgb"] = []
+    if metadata.has_intensity:
+        viewer["point_intensity"] = []
     tile_names: List[str] = []
     scanner_ids: List[int] = []
     saw_run2 = False
@@ -139,12 +147,20 @@ def _stream_tiles(
             processed += len(x)
             if progress:
                 _progress(f"Streaming chunk {chunk_number + 1}", processed, metadata.point_count)
+            if progress_callback:
+                progress_callback({"stage": "streaming", "points_processed": processed, "point_count": metadata.point_count})
             mask = np.arange(len(x)) % sample_stride == 0
             z_sample = z[mask]
             if len(z_sample):
                 z01 = (z_sample - z0) / max((z1 - z0), 1e-6)
-                viewer_points.extend(np.column_stack((x[mask], y[mask], z_sample)).round(4).tolist())
-                viewer_colors.extend(_elevation_color(z01))
+                viewer["points"].extend(np.column_stack((x[mask], y[mask], z_sample)).round(4).tolist())
+                viewer["point_colors"].extend(_elevation_color(z01))
+                if viewer["point_rgb"] is not None and chunk.rgb is not None:
+                    viewer["point_rgb"].extend(np.clip(chunk.rgb[mask] / 65535.0, 0.0, 1.0).round(4).tolist())
+                if viewer["point_intensity"] is not None:
+                    values = chunk.intensity[mask]
+                    if values.max() > 0:
+                        viewer["point_intensity"].extend(np.clip(values / float(values.max()), 0.0, 1.0).round(4).tolist())
             if chunk.point_source_id is not None:
                 scanner_ids.extend(int(value) for value in np.unique(chunk.point_source_id) if int(value) > 0)
             labels = gps_run_labels(chunk.gps_time)
@@ -160,6 +176,10 @@ def _stream_tiles(
                 _append_tile(tiles_dir, tile_name, source_header, chunk, tile_mask)
         if progress:
             print()
+    if viewer["point_rgb"] is not None and not viewer["point_rgb"]:
+        viewer["point_rgb"] = None
+    if viewer["point_intensity"] is not None and not viewer["point_intensity"]:
+        viewer["point_intensity"] = None
     summary = RunSummary(
         input_path=str(input_path), point_count=metadata.point_count, bounds=metadata.bounds,
         crs=crs, las_version=metadata.version, point_format=metadata.point_format,
@@ -167,7 +187,7 @@ def _stream_tiles(
         run_count=(2 if saw_run2 else (1 if metadata.has_gps_time else 0)),
         processing_version=VERSION,
     )
-    return summary, tile_names, viewer_points, viewer_colors
+    return summary, tile_names, viewer
 
 
 def _detect_tile(
@@ -239,6 +259,41 @@ def _attach_highlight_points(ctx: TileContext, asset: Asset) -> None:
     asset.geometry = geometry
 
 
+def _compute_point_classes(viewer_points: List[List[float]], assets: List[Asset], class_names: List[str]) -> List[int]:
+    """Label each viewer point with the class of the nearest asset source point.
+
+    Labels are derived from the *actual* detection points (``highlight_points``)
+    via a spatial grid, so the AI DETECTION coloring is real evidence, not paint.
+    Class ids start at 1; 0 = no detected asset nearby.
+    """
+    if not viewer_points or not assets:
+        return [0] * len(viewer_points)
+    cell = 1.0
+    grid: Dict[Tuple[int, int, int], List[Tuple[int, float, float, float]]] = defaultdict(list)
+    for class_id, name in enumerate(class_names, start=1):
+        for asset in assets:
+            if asset.asset_class != name:
+                continue
+            for point in (asset.geometry or {}).get("highlight_points", []):
+                key = (int(point[0] // cell), int(point[1] // cell), int(point[2] // cell))
+                grid[key].append((class_id, point[0], point[1], point[2]))
+    radius2 = 1.0  # metres
+    result = [0] * len(viewer_points)
+    for index, (x, y, z) in enumerate(viewer_points):
+        kx, ky, kz = int(x // cell), int(y // cell), int(z // cell)
+        best, best_d2 = 0, radius2 * radius2
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    for class_id, px, py, pz in grid.get((kx + dx, ky + dy, kz + dz), ()):
+                        d2 = (x - px) ** 2 + (y - py) ** 2 + (z - pz) ** 2
+                        if d2 < best_d2:
+                            best_d2 = d2
+                            best = class_id
+        result[index] = best
+    return result
+
+
 def _assets_from_roadmarking(
     instances: List[Dict[str, object]], tile: str, summary: RunSummary,
     id_counts: Counter, settings: ProcessingSettings,
@@ -297,8 +352,15 @@ def process_las(
     class_mapping: Optional[Dict[str, Dict[str, object]]] = None,
     confidence_weights: Optional[Dict[str, Dict[str, float]]] = None,
     progress: bool = True,
+    progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> RunSummary:
-    """Run the full pipeline: LAS -> tiling -> detection -> inventory -> exports."""
+    """Run the full pipeline: LAS -> tiling -> detection -> inventory -> exports.
+
+    ``progress_callback`` receives stage dicts:
+      {"stage": "validating"|"streaming"|"pointcept"|"roadmarking"|"detecting"|"exporting"|"done",
+       "points_processed": int, "point_count": int, "tiles_done": int, "tiles_total": int,
+       "assets": int, "elapsed_seconds": float, "message": str}
+    """
     settings = settings or ProcessingSettings()
     class_mapping = class_mapping or DEFAULT_CLASS_MAPPING
     del confidence_weights  # reserved for config-driven confidence weighting (configs/classes.yaml)
@@ -307,7 +369,22 @@ def process_las(
     output.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
 
-    summary, tile_names, viewer_points, viewer_colors = _stream_tiles(path, output, settings, progress)
+    def report(stage: str, **extra: object) -> None:
+        if progress_callback:
+            progress_callback({
+                "stage": stage,
+                "points_processed": 0,
+                "point_count": 0,
+                "tiles_done": 0,
+                "tiles_total": 0,
+                "assets": 0,
+                "elapsed_seconds": round(time.monotonic() - started, 2),
+                "message": "",
+                **extra,
+            })
+
+    report("validating", message="Validating LAS metadata")
+    summary, tile_names, viewer = _stream_tiles(path, output, settings, progress, progress_callback)
 
     # ---- Optional learned backend: Pointcept / PTv3 ---------------------------
     predictions: Dict[str, np.ndarray] = {}
@@ -319,6 +396,7 @@ def process_las(
                 "Pointcept backend requires --pointcept-root, --pointcept-config, and "
                 "--pointcept-weight. No class mapping is assumed without them."
             )
+        report("pointcept", message="Running Pointcept / PTv3 inference on tiles")
         class_names = load_class_names(settings.pointcept_class_names)
         backend = run_pointcept_test(
             root=settings.pointcept_root, config=settings.pointcept_config,
@@ -335,7 +413,7 @@ def process_las(
     # ---- Optional specialized subsystem: RoadMarkingExtraction -------------------
     roadmarking_assets: List[Asset] = []
     if settings.roadmarking_command:
-        print("[roadmarking] running external extraction subsystem per tile", flush=True)
+        report("roadmarking", message="Running RoadMarkingExtraction subsystem per tile")
         work_dir = output / "roadmarking"
         id_counts_rm: Counter = Counter()
         for tile_name in tile_names:
@@ -355,7 +433,9 @@ def process_las(
     all_assets: List[Asset] = []
     if progress:
         print(f"[detection] processing {len(tile_names)} tiles", flush=True)
-    for tile_name in tile_names:
+    for tile_index, tile_name in enumerate(tile_names):
+        report("detecting", tiles_done=tile_index + 1, tiles_total=len(tile_names),
+               message=f"Detecting assets in {tile_name}")
         all_assets.extend(_detect_tile(
             output / "tiles", tile_name, summary, settings, id_counts,
             predictions, class_names, class_mapping, sample_stride, progress,
@@ -363,11 +443,15 @@ def process_las(
     all_assets.extend(roadmarking_assets)
 
     # ---- Quality control + export -------------------------------------------------
+    report("exporting", assets=len(all_assets), message="Quality control and export")
     all_assets, qc_report = run_quality_control(all_assets, settings)
     summary.assets = all_assets
     summary.elapsed_seconds = time.monotonic() - started
 
-    write_outputs(output, summary, qc_report, viewer_points, viewer_colors)
+    asset_classes = sorted({asset.asset_class for asset in all_assets})
+    viewer["point_class"] = _compute_point_classes(viewer["points"], all_assets, asset_classes)
+    viewer["point_class_names"] = asset_classes
+    write_outputs(output, summary, qc_report, viewer)
     write_viewer(output / "viewer")
     shutil.copy2(output / "viewer-data.json", output / "viewer" / "viewer-data.json")
     (output / "tiles" / "manifest.json").write_text(
@@ -379,6 +463,8 @@ def process_las(
             f"[done] {len(all_assets)} assets in {summary.elapsed_seconds:.1f}s -> {output}",
             flush=True,
         )
+    report("done", assets=len(all_assets), message="Processing complete",
+           elapsed_seconds=round(time.monotonic() - started, 2))
     return summary
 
 

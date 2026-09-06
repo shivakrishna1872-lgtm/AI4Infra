@@ -69,12 +69,15 @@ def bright_near_ground_mask(ctx: TileContext, height_max: float) -> np.ndarray:
     base = ctx.height <= height_max
     if not len(ctx.intensity):
         return np.zeros(len(ctx.x), dtype=bool)
-    intensity_floor = 1.5 * float(np.median(ctx.intensity[base])) if base.any() else 0.0
+    # Relative-contrast floor: a marking is *brighter than its surroundings*, not
+    # merely in the upper tail. Without this, the bright tail of road/ground
+    # reflectivity merges into real markings and pollutes their components.
+    intensity_floor = 2.5 * float(np.median(ctx.intensity[base])) if base.any() else 0.0
     intensity_quantile = float(np.quantile(ctx.intensity[base], settings.marking_intensity_quantile))
     bright = ctx.intensity >= max(intensity_floor, intensity_quantile)
     if ctx.rgb is not None and base.any():
         brightness = ctx.rgb.mean(axis=1)
-        brightness_floor = 1.3 * float(np.median(brightness[base]))
+        brightness_floor = 1.8 * float(np.median(brightness[base]))
         brightness_quantile = float(np.quantile(brightness[base], settings.marking_brightness_quantile))
         bright |= brightness >= max(brightness_floor, brightness_quantile)
     # Exclude points inside tall structures (pole bases, posts) via cell z-range
@@ -200,7 +203,7 @@ def build_asset(
         source_point_source_id=source_id,
         model_prior_class=prior_class_name,
         model_confidence=model_factor,
-        processing_version="0.2.0",
+        processing_version="0.3.0",
         geometry={
             "ground_elevation_m": round(ctx.ground, 4),
             "eigen_planarity": round(metrics["planarity"], 3),

@@ -12,6 +12,29 @@ A dependency-free 3D viewer is layered over the artifacts.
 Nothing is faked: every asset is derived from real measured signals in the input LAS,
 and every unavailable measurement is exported as `null`, never guessed.
 
+## Architecture
+
+```text
+ LAS / LAZ ──► streaming reader (laspy + lazrs) ──► validation (LAS 1.4 / PDR 7 / CRS)
+      │
+      ▼
+ spatial tiling (per-tile LAS) ──► [optional] Pointcept / PTv3 predictions
+      │                               [optional] RoadMarkingExtraction DXF vectors
+      ▼
+ geometric instance extraction (pavement · utilities · signs · safety)
+      │
+      ▼
+ attribution + confidence + QC ──► exports: assets.json/csv/geojson, inventory.json, run.json
+      │
+      ▼
+ viewer-data.json ──► React / Three.js 3D digital twin (web UI + FastAPI server)
+
+ Simulation:  synthetic mobile-LiDAR corridor ──► same pipeline ──► same viewer
+ (Quick Simulation needs zero input files; Data Simulation runs the same path
+  over an uploaded .las / .laz and is labeled EXTERNAL / SIMULATION, never
+  COMPETITION DATA)
+```
+
 ---
 
 ## Quick start
@@ -36,8 +59,49 @@ Open `http://127.0.0.1:8765`. The viewer is local and uses no CDN or cloud servi
 Verification:
 
 ```bash
-pytest -q          # 63 tests, including detectors on the synthetic scene
+pytest -q          # full test suite, including detectors on the synthetic scene
 ```
+
+## Simulation & demo modes
+
+The application ships a browser UI (`web/`) plus a FastAPI server that serves both
+it and the processing API from one origin (`python -m infra_inventory app`). The UI
+distinguishes three data classes — **COMPETITION DATA**, **EXTERNAL REAL DATA**, and
+**SIMULATION** — and never mixes them.
+
+### Quick Simulation (no data required)
+
+Generates a synthetic mobile-LiDAR-style infrastructure corridor (road, painted
+markings, utility poles with conductors, signs, guardrails) as a real LAS 1.4 /
+Point Format 7 file, then runs it through the *same* pipeline as uploaded data.
+
+```bash
+# CLI
+python -m infra_inventory simulate --output output/sim --length 400 --seed 7
+
+# API (used by the web UI's "Open Simulation" button)
+curl -X POST http://127.0.0.1:8766/api/simulate
+```
+
+Use it to demo the platform or iterate on the pipeline when no LiDAR file is at hand.
+Generated projects are labeled `SIMULATED` end-to-end (project metadata, viewer
+overlay, exports).
+
+### Data Simulation (requires data)
+
+Upload a **.las** or **.laz** file (drag-and-drop in the UI, or `POST /api/simulate/data`)
+and the same extraction pipeline runs over it. Both `.las` and LAZ-compressed `.laz`
+are supported — LAZ decoding is handled through laspy's `lazrs` backend.
+
+### Learned backends (optional, GPU machines only)
+
+* [Pointcept](https://github.com/Pointcept/Pointcept) / [Point Transformer V3](https://github.com/Pointcept/PointTransformerV3) — per-tile semantic priors via Pointcept's own `tools/test.py` (CUDA; FlashAttention optional).
+* [RoadMarkingExtraction](https://github.com/YuePanEdward/RoadMarkingExtraction) — specialized marking vectorization adapter.
+
+Neither is required to run the application: geometry-only detection is the default
+and needs no GPU, which is deliberate so the whole project never depends on one
+machine. See [`docs/upstream-integration.md`](docs/upstream-integration.md) and
+`configs/pointcept/` for wiring details.
 
 ## What runs today (all real)
 
@@ -117,13 +181,21 @@ infra_inventory/
 ├── viewer.py               # dependency-free WebGL viewer
 ├── pointcept.py            # real tools/test.py bridge + prediction loader
 ├── roadmarking.py          # external C++ subsystem adapter + DXF parser
-├── synthetic.py            # synthetic test scene generator
+├── simulation.py           # Quick Simulation / Data Simulation pipelines
+├── server.py               # FastAPI app: project API + hosted web UI
+├── synthetic.py            # synthetic mobile-LiDAR scene generators
 └── download_models.py      # verified pretrained-weight downloads
 configs/                    # classes.yaml, model.yaml, processing.yaml, pointcept/ templates
 scripts/                    # download_models.py, make_synthetic_las.py
-tests/                      # 63 tests incl. end-to-end on the synthetic scene
-docs/                       # PROCEDURE.md, ENHANCEMENT.md, MODEL_NOTES.md, upstream-integration.md
+tests/                      # full test suite incl. end-to-end, LAZ upload, and simulation paths
+docs/                       # PROCEDURE, ASSET_SCHEMA, VALIDATION, LIMITATIONS, ENHANCEMENT, MODEL_NOTES, upstream-integration
 ```
+
+Documentation: [`docs/PROCEDURE.md`](docs/PROCEDURE.md) (1-mile workflow),
+[`docs/ASSET_SCHEMA.md`](docs/ASSET_SCHEMA.md) (inventory schema & competition
+mapping), [`docs/VALIDATION.md`](docs/VALIDATION.md) (precision/recall/F1 &
+positional-error framework), [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md)
+(known edge cases), [`docs/ENHANCEMENT.md`](docs/ENHANCEMENT.md) (roadmap).
 
 ## Artifact contract
 

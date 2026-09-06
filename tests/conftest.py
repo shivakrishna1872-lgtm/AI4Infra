@@ -21,6 +21,15 @@ def synthetic_las(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 @pytest.fixture
+def simulated_project(tmp_path: Path) -> dict:
+    """A processed simulation project (Quick Simulation) for UI tests."""
+    from infra_inventory.simulation import run_quick_simulation
+
+    project = run_quick_simulation(tmp_path, length_m=200.0, seed=11)
+    return project
+
+
+@pytest.fixture
 def output_dir(tmp_path: Path) -> Path:
     return tmp_path / "out"
 
@@ -30,3 +39,21 @@ def synthetic_summary(synthetic_las: Path) -> dict:
     from infra_inventory.las_reader import read_metadata
 
     return read_metadata(synthetic_las).to_dict()
+
+
+@pytest.fixture
+def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """FastAPI TestClient isolated from any real appdata directory."""
+    from fastapi.testclient import TestClient
+
+    from infra_inventory import server
+
+    monkeypatch.setattr(server, "DATA_DIR", tmp_path / "appdata")
+    with TestClient(server.app) as test_client:
+        yield test_client
+
+
+@pytest.fixture
+def clean_appdata():
+    """Marker: server tests manage their own projects via the API."""
+    yield

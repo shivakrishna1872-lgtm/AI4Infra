@@ -173,6 +173,34 @@ Tune `--tile-size` down (e.g. 25 m) if tiles get too dense for memory, or up if
 instances keep splitting across boundaries. See `docs/ENHANCEMENT.md` for the full
 tuning and fine-tuning guide.
 
+## 14. Compressed LAZ input
+
+`.laz` files are first-class input. The `lazrs` backend is installed with the
+dev extras; without it, uploads fail with a clear "LAZ backend missing" error.
+
+```bash
+python -m infra_inventory validate data/corridor.laz
+python -m infra_inventory process data/corridor.laz --output output/corridor
+```
+
+In the web app, drag the `.laz`/`.las` into the upload zone or use
+`POST /api/projects/{id}/upload` + `POST /api/projects/{id}/process`. Jobs are
+persisted to disk, so backend restarts never lose them.
+
+## 15. Simulation & automated validation
+
+Quick Simulation (zero data) generates a synthetic mobile-LiDAR corridor and
+runs it through the same pipeline — useful for demos, QA, and detector
+regression checks:
+
+```bash
+python -m infra_inventory simulate --output output/sim --length 400 --seed 7
+```
+
+The project exports `simulation_meta.ground_truth` (the exact placed objects).
+Score the run against it with the snippet in `docs/VALIDATION.md` §2a, which
+reports Precision, Recall, F1, and positional RMSE per class.
+
 ## Known limitations (read before judging)
 
 * Instances crossing tile boundaries can be split into two assets; QC flags nearby

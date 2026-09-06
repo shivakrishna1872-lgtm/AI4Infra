@@ -28,6 +28,7 @@ from .errors import InfraError
 from .models import ProcessingSettings
 from .pipeline import process_las
 from .pointcept import describe_backend
+from .simulation import run_data_simulation
 
 try:
     import yaml
@@ -220,6 +221,38 @@ def _demo_data(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _simulate(args: argparse.Namespace) -> int:
+    from .simulation import run_quick_simulation
+    from .models import ProcessingSettings
+
+    settings = ProcessingSettings()
+    settings.viewer_point_limit = args.viewer_points or settings.viewer_point_limit
+    project = run_quick_simulation(
+        Path(args.output),
+        length_m=args.length,
+        seed=args.seed,
+        settings=settings,
+    )
+    print(json.dumps({
+        "project": project["name"],
+        "project_id": project["id"],
+        "points": project["point_count"],
+        "assets": project["asset_count"],
+        "output_dir": project["output_dir"],
+        "simulated": True,
+        "scene_parts": project.get("scene_summary"),
+        "simulation_meta": project.get("simulation_meta"),
+    }, indent=2))
+    print("\nSIMULATION / DEMO DATA - never present simulated detections as competition results.")
+    return EXIT_OK
+
+
+def _app(args: argparse.Namespace) -> int:
+    from .server import main as server_main
+
+    return server_main()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="infra-inventory",
@@ -282,6 +315,16 @@ def build_parser() -> argparse.ArgumentParser:
     demo = subparsers.add_parser("demo-data", help="Generate a synthetic test LAS (testing only)")
     demo.add_argument("--output", default="data", help="Output directory (default: ./data)")
     demo.set_defaults(func=_demo_data)
+
+    simulate = subparsers.add_parser("simulate", help="Generate a realistic simulated corridor and run the pipeline (demo only)")
+    simulate.add_argument("--output", default="data", help="Output directory (default: ./data)")
+    simulate.add_argument("--length", type=float, default=400.0, help="Corridor length in metres")
+    simulate.add_argument("--seed", type=int, default=None, help="Scene seed (omit for randomized)")
+    simulate.add_argument("--viewer-points", type=int, help="Points sampled for the 3D viewer")
+    simulate.set_defaults(func=_simulate)
+
+    app_parser = subparsers.add_parser("app", help="Run the FastAPI inspection platform (pip install -e '.[server]')")
+    app_parser.set_defaults(func=_app)
     return parser
 
 

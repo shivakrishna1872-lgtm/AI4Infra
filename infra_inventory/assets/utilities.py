@@ -21,6 +21,7 @@ from .common import TileContext, build_asset
 def detect_utilities(ctx: TileContext) -> List[Asset]:
     assets: List[Asset] = []
     settings = ctx.settings
+    pole_points = np.zeros(len(ctx.x), dtype=bool)
 
     # ---- Poles ----------------------------------------------------------------
     # Exclude the ground surface itself (height < 0.3) so the pole stands as its
@@ -29,18 +30,25 @@ def detect_utilities(ctx: TileContext) -> List[Asset]:
     for component in grid_components(ctx.x, ctx.y, pole_mask, settings.pole_resolution_m, min_cells=1):
         if len(component) < settings.pole_min_points:
             continue
+        # Attachments (crossarms, insulator brackets, wires) sit at the pole top;
+        # measure pole-ness from the lower 70% of the trunk so a crossarm never
+        # disqualifies a real pole. Point count / centroid stay full-component.
+        zs = ctx.z[component]
+        z_lo, z_hi = float(zs.min()), float(zs.max())
+        trunk = component[zs <= z_lo + 0.7 * max(z_hi - z_lo, 1e-3)]
         metrics = component_metrics(ctx.x, ctx.y, ctx.z, component)
-        footprint = max(metrics["length_m"], metrics["width_m"])
+        trunk_metrics = component_metrics(ctx.x, ctx.y, ctx.z, trunk)
+        footprint = max(trunk_metrics["length_m"], trunk_metrics["width_m"])
         if (
             metrics["height_m"] >= settings.pole_min_height_m
             and footprint <= settings.pole_max_footprint_m
-            and metrics["columnarity"] >= settings.pole_min_columnarity
+            and trunk_metrics["columnarity"] >= settings.pole_min_columnarity
         ):
             # Geometry: how pole-like is it? Dominant vertical extent + narrow base.
             vertical_ratio = metrics["height_m"] / max(footprint, 1e-3)
             geometry_score = min(0.95, 0.45 + min(vertical_ratio / 8.0, 0.35) + metrics["verticality"] * 0.15)
             explanation = (
-                f"Narrow footprint ({footprint:.2f} m) with {metrics['height_m']:.1f} m vertical "
+                f"Narrow trunk footprint ({footprint:.2f} m) with {metrics['height_m']:.1f} m vertical "
                 "extent satisfies utility-pole geometry rules."
             )
             asset = build_asset(
@@ -55,6 +63,7 @@ def detect_utilities(ctx: TileContext) -> List[Asset]:
             )
             if asset is not None:
                 assets.append(asset)
+                pole_points[component] = True
 
     # ---- Overhead conductors ---------------------------------------------------
     conductor_mask = ctx.height >= settings.conductor_min_height_m
@@ -89,7 +98,11 @@ def detect_utilities(ctx: TileContext) -> List[Asset]:
                 assets.append(asset)
 
     # ---- Cabinets ---------------------------------------------------------------
+    # Pole trunks masquerade as compact near-ground boxes when sliced by the
+    # height band; exclude points already claimed by a detected pole. Cabinets
+    # must also sit with their base near the ground (not float at sign height).
     cabinet_mask = (ctx.height >= settings.cabinet_min_height_m) & (ctx.height <= settings.cabinet_max_height_m)
+    cabinet_mask &= ~pole_points
     for component in grid_components(ctx.x, ctx.y, cabinet_mask, settings.cabinet_resolution_m, min_cells=2):
         if len(component) < settings.cabinet_min_points:
             continue

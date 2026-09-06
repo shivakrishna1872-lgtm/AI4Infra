@@ -15,7 +15,19 @@ from typing import Dict, Iterator, Optional, Tuple
 import laspy
 import numpy as np
 
-from .errors import EmptyPointCloudError, InvalidCoordinateDataError, InputNotFoundError, MalformedLasError
+from .errors import (
+    EmptyPointCloudError,
+    InvalidCoordinateDataError,
+    InputNotFoundError,
+    LazBackendMissingError,
+    MalformedLasError,
+)
+
+
+def _laz_backend_error(exc: Exception) -> bool:
+    """True when the exception is laspy complaining a LAZ backend is missing."""
+    message = str(exc).lower()
+    return "laz" in message and ("backend" in message or "lazrs" in message or "laszip" in message)
 
 LAS14 = "1.4"
 EXPECTED_POINT_FORMAT = 7
@@ -117,7 +129,11 @@ def read_metadata(path: str | Path) -> LasMetadata:
             )
     except EmptyPointCloudError:
         raise
+    except LazBackendMissingError:
+        raise
     except Exception as exc:  # laspy raises generic OSErrors/ValueErrors on malformed files
+        if _laz_backend_error(exc):
+            raise LazBackendMissingError() from exc
         raise MalformedLasError(str(exc)) from exc
 
 
@@ -175,6 +191,8 @@ def iter_chunks(path: str | Path, chunk_size: int) -> Iterator[Tuple[LasMetadata
     except InvalidCoordinateDataError:
         raise
     except Exception as exc:
+        if _laz_backend_error(exc):
+            raise LazBackendMissingError() from exc
         raise MalformedLasError(str(exc)) from exc
 
 
