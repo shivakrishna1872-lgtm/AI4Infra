@@ -1,0 +1,58 @@
+# Pointcept / PTv3 backend configuration
+#
+# The pretrained model is NOT assumed to know the four competition categories.
+# This file documents exactly which upstream classes may contribute *evidence*
+# toward an infrastructure class, together with a weight. Every prediction is
+# still passed through the geometry detectors; the model only modulates the
+# `model` confidence factor of assets whose geometry already matches.
+
+model:
+  name: point-transformer-v3
+  variant: pt-v3m1-base-nuscenes-semseg
+  source: https://huggingface.co/Pointcept/PointTransformerV3
+  weight_relative_path: nuscenes-semseg-pt-v3m1-0-base/model/model_best.pth
+  config_relative_path: nuscenes-semseg-pt-v3m1-0-base/config.py
+  sha256: e2774d2fa1dd33e640a514afe0bd1e5af94eb08be19d08d1f9402f20dfd6db94
+  license: CC-BY-NC-4.0 (non-commercial; see upstream repository)
+  notes: >
+    Trained on nuScenes lidar segmentation (16 classes). Waymo weights cannot be
+    released under Waymo regulations, so nuScenes is the documented outdoor
+    semantic-segmentation starting point.
+
+# PTv3 runtime constraints (from the upstream repository)
+runtime:
+  cuda_extensions: required
+  flash_attention: optional   # set enable_flash=False and smaller patch sizes to run without it
+  gpu: recommended           # the `geometry` backend never touches CUDA
+
+# Upstream class -> infrastructure evidence.
+# `asset_class: null` means "context only" (never creates an asset by itself).
+class_mapping:
+  driveable_surface:
+    asset_class: pavement
+    subclass: travelled_surface
+    weight: 0.90
+    note: "Direct semantic evidence for travelled surface."
+  barrier:
+    asset_class: safety_barrier
+    subclass: concrete_barrier
+    weight: 0.80
+    note: "nuScenes 'barrier' maps to the safety category; geometry must still confirm."
+  manmade:
+    asset_class: null
+    weight: 0.35
+    evidence_for: [utility_pole, traffic_sign, utility_cabinet]
+    note: "Weak evidence for poles/signs/cabinets; geometry decides."
+  sidewalk:
+    asset_class: null
+    weight: 0.0
+    note: "Context only - do not label as travelled surface."
+  terrain:
+    asset_class: null
+    weight: 0.0
+    note: "Context only."
+  vegetation:
+    asset_class: null
+    weight: 0.0
+    note: "Context only."
+  # Other nuScenes classes (vehicles, pedestrians, ...) never map to assets.

@@ -1,0 +1,86 @@
+# AI4Infra -> Pointcept PTv3 adapter config (TEMPLATE)
+#
+# Adapt this file to your environment, save it as `infra_ptv3_nuscenes.py` and
+# pass it with --pointcept-config. It must consume the LAS tiles the pipeline
+# writes to <out>/tiles/ and export one <tile_name>.npy prediction per tile.
+#
+# Requirements: a working Pointcept environment with the PTv3 nuScenes model
+# code. Run `python -m infra_inventory download-models` for the checkpoint.
+#
+# This template is a starting point - Pointcept's own
+# nuscenes-semseg-pt-v3m1-0-base/config.py is the source of truth for the model
+# block; diff against it when upgrading Pointcept.
+
+_base_ = None  # replace with the upstream nuscenes config path, e.g.
+# _base_ = "/path/to/Pointcept/configs/nuscenes/semseg-ptv3/semseg-ptv3-v1m1-0-base.py"
+
+# ---------------------------------------------------------------------------
+# 1. Dataset adapter: one LAS tile per sample.
+#    Implement a Pointcept Dataset whose __getitem__ reads a tile .las
+#    (laspy), returns a dict with:
+#        coord    (N, 3) float32,  color   (N, 3) float32 [0, 1]  (if RGB)
+#        strength (N, 1) float32  (normalized intensity)
+#        segment  (N,)  int64 class ids (-1 for unlabeled)
+#    and whose test split yields tile names matching <tile_name>.npy.
+# ---------------------------------------------------------------------------
+# from pointcept.datasets import DATASETS, ConcatDataset
+#
+# @DATASETS.register_module()
+# class InfraLasTilesDataset:
+#     def __init__(self, split="test", data_root="out/tiles", class_names=None, **kwargs):
+#         self.data_list = sorted(Path(data_root).glob("tile_*.las"))
+#         self.class_names = class_names
+#     def __getitem__(self, idx):
+#         tile = self.data_list[idx]
+#         # read LAS -> coord, strength (intensity/65535), color (rgb/65535)
+#         return dict(coord=coord, strength=strength, color=color, segment=segment,
+#                     name=tile.stem)
+#     def __len__(self):
+#         return len(self.data_list)
+#
+# data = dict(
+#     train=dict(type="InfraLasTilesDataset", split="train", data_root="out/tiles"),
+#     val=dict(type="InfraLasTilesDataset", split="test", data_root="out/tiles"),
+#     test=dict(type="InfraLasTilesDataset", split="test", data_root="out/tiles"),
+# )
+
+# ---------------------------------------------------------------------------
+# 2. Taxonomy: ORDER MUST MATCH configs/pointcept/nuscenes_class_names.json
+# ---------------------------------------------------------------------------
+class_names = [
+    "ignore", "barrier", "bicycle", "bus", "car", "construction_vehicle",
+    "motorcycle", "pedestrian", "traffic_cone", "trailer", "truck",
+    "driveable_surface", "other_flat", "sidewalk", "terrain", "manmade",
+    "vegetation",
+]
+num_classes = len(class_names)
+
+# ---------------------------------------------------------------------------
+# 3. Model: PTv3 base (FlashAttention optional - disable for non-compatible GPUs)
+# ---------------------------------------------------------------------------
+model = dict(
+    type="PTv3Segmentor",
+    in_channels=4,  # coord + strength (or coord + color)
+    patch_size=(512, 512, 256),  # smaller than upstream default for lower VRAM
+    dpr=0.1,
+    num_classes=num_classes,
+    enable_flash=False,  # FlashAttention OFF: works on more GPUs
+)
+
+# ---------------------------------------------------------------------------
+# 4. Test: export one .npy per tile (required by the AI4Infra pipeline)
+# ---------------------------------------------------------------------------
+test = dict(
+    type="DefaultTester",
+    save_path="predictions",        # overridden by --options save_path=<out>/predictions
+    save_pred=True,                 # writes <tile_name>.npy (pred argmax tensor)
+    eval=True,
+    eval_only=True,
+)
+
+hook = dict(type="DefaultHook", save_epoch=1)
+seed = 42
+num_worker = 4
+batch_size = 1
+epoch = 1
+eval_epoch = 1

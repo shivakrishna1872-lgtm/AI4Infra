@@ -1,0 +1,101 @@
+# AI4Infra processing configuration
+#
+# Every key maps 1:1 to a field on ProcessingSettings (infra_inventory/models.py).
+# CLI flags take precedence over this file. Pass with:
+#   python -m infra_inventory process input.las --output out/ --config configs/processing.yaml
+
+# --- I/O and streaming ---
+chunk_size: 500000          # points per streaming chunk (never load the whole cloud)
+tile_size_m: 40.0           # spatial tile edge length in metres
+tile_overlap_m: 0.0         # 0 = non-overlapping tiles (boundary instances are QC-deduped)
+viewer_point_limit: 120000  # points sampled for the 3D viewer
+point_index_sample_limit: 256
+save_tiles: true            # persist per-tile LAS files under output/tiles/
+
+# --- Backends ---
+backend: geometry           # geometry | pointcept
+pointcept_root: null
+pointcept_config: null
+pointcept_weight: null
+pointcept_class_names: null # JSON file: taxonomy of the pointcept config, in class-id order
+pointcept_num_gpus: 1
+roadmarking_command: null   # path to the RoadMarkingExtraction run script (opt-in)
+roadmarking_config: null    # path to its parameter config
+
+# --- Validation ---
+strict_las14: false
+
+# --- Preprocessing ---
+ground_bin_m: 2.0
+ground_quantile: 0.15
+
+# --- Pavement ---
+pavement_height_m: 0.3
+min_pavement_points: 150
+marking_height_m: 0.35
+marking_resolution_m: 0.25
+marking_min_points: 20
+marking_intensity_quantile: 0.86
+marking_brightness_quantile: 0.86
+lane_line_min_length_m: 2.0
+lane_line_max_width_m: 0.6
+stop_line_min_width_m: 1.0
+crosswalk_min_width_m: 2.5
+symbol_max_side_m: 1.5
+
+# --- Utilities ---
+pole_min_height_m: 2.5
+pole_max_footprint_m: 1.35
+pole_min_points: 40
+pole_resolution_m: 0.45
+conductor_min_height_m: 4.0
+conductor_min_length_m: 8.0
+conductor_max_width_m: 0.6
+conductor_max_height_extent_m: 2.5
+conductor_min_points: 60
+conductor_resolution_m: 0.5
+cabinet_min_height_m: 0.4
+cabinet_max_height_m: 3.0
+cabinet_min_side_m: 0.3
+cabinet_max_side_m: 3.5
+cabinet_min_points: 60
+cabinet_resolution_m: 0.3
+
+# --- Signs ---
+sign_min_height_m: 1.0
+sign_max_height_m: 8.0
+sign_min_points: 25
+sign_resolution_m: 0.3
+sign_min_planarity: 0.55
+sign_min_panel_area_m2: 0.04
+sign_max_panel_area_m2: 9.0
+sign_max_panel_side_m: 4.0
+sign_max_thickness_m: 0.35
+sign_support_search_m: 1.4
+
+# --- Safety ---
+guardrail_min_height_m: 0.3
+guardrail_max_height_m: 1.7
+guardrail_min_length_m: 6.0
+guardrail_max_width_m: 1.8
+guardrail_max_height_extent_m: 1.8
+guardrail_min_points: 60
+guardrail_resolution_m: 0.5
+barrier_min_length_m: 8.0
+barrier_min_width_m: 0.35
+barrier_max_width_m: 1.4
+barrier_min_height_m: 0.5
+barrier_max_height_m: 1.5
+rumble_min_length_m: 0.4
+rumble_max_length_m: 3.0
+rumble_min_width_m: 0.15
+rumble_max_width_m: 0.8
+rumble_min_band_points: 12
+rumble_min_bands: 3
+rumble_max_gap_m: 1.8
+
+# --- Confidence / QC ---
+min_asset_points: 25
+low_confidence_threshold: 0.45
+duplicate_distance_m: 1.5
+max_support_points: 4000

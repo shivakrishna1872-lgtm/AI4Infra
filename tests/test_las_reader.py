@@ -1,0 +1,63 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+
+from infra_inventory.las_reader import gps_run_labels, iter_chunks, read_metadata
+
+
+def test_metadata_las14_format7(synthetic_las: Path) -> None:
+    metadata = read_metadata(synthetic_las)
+    assert metadata.version == "1.4"
+    assert metadata.point_format == 7
+    assert metadata.point_count > 0
+    assert metadata.has_intensity
+    assert metadata.has_rgb
+    assert metadata.has_gps_time
+    assert metadata.has_point_source_id
+    assert metadata.bounds[3] > metadata.bounds[0]
+    assert metadata.bounds[5] > metadata.bounds[2]
+
+
+def test_streaming_chunks_preserve_points(synthetic_las: Path) -> None:
+    total = 0
+    chunks = 0
+    for _, _, chunk in iter_chunks(synthetic_las, chunk_size=10_000):
+        total += len(chunk.x)
+        chunks += 1
+        assert np.isfinite(chunk.x).all()
+        assert np.isfinite(chunk.z).all()
+    assert total == read_metadata(synthetic_las).point_count
+    assert chunks >= 3  # 28k points / 10k chunk size
+
+
+def test_streaming_chunks_global_offsets(synthetic_las: Path) -> None:
+    offsets = []
+    for _, _, chunk in iter_chunks(synthetic_las, chunk_size=10_000):
+        offsets.append(chunk.global_offset)
+    assert offsets == sorted(offsets)
+    assert offsets[0] == 0
+
+
+def test_gps_run_labels_split() -> None:
+    gps = np.concatenate((np.linspace(1_000_000, 1_100_000, 2000), np.linspace(6_000_000, 6_100_000, 2000)))
+    labels = gps_run_labels(gps)
+    assert labels is not None
+    assert set(np.unique(labels)) == {1, 2}
+    assert labels[:2000].max() == 1 and labels[2000:].min() == 2
+
+
+def test_gps_run_labels_single_population() -> None:
+    gps = np.linspace(1_000_000, 1_100_000, 2000)
+    assert gps_run_labels(gps) is None
+
+
+def test_read_metadata_missing_file(tmp_path: Path) -> None:
+    from infra_inventory.errors import InputNotFoundError
+
+    try:
+        read_metadata(tmp_path / "nope.las")
+    except InputNotFoundError:
+        return
+    raise AssertionError("Expected InputNotFoundError")

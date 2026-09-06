@@ -1,21 +1,61 @@
 # Upstream Integration Notes
 
-This project separates an immediately runnable CPU pipeline from optional learned backends. It does not relabel an upstream benchmark taxonomy as a competition class without an evidence-backed adapter.
+This project separates an immediately runnable CPU pipeline from optional learned
+backends, and never relabels an upstream benchmark taxonomy as a competition class
+without an evidence-backed adapter.
 
 ## Pointcept and Point Transformer V3
 
-[Pointcept](https://github.com/Pointcept/Pointcept) drives evaluation through `tools/test.py`, which constructs its tester from a config and invokes the configured dataset/model stack. The PTv3 nuScenes semantic-segmentation configuration uses `coord` plus `strength` features and declares a 16-class driving taxonomy; that taxonomy includes `driveable_surface` and `barrier`, but not the full AI4Infra asset taxonomy.
+Used (real, documented):
 
-The optional `--backend pointcept` bridge therefore invokes the real `tools/test.py` entrypoint only with a supplied Pointcept root, adapted config, and matching checkpoint. The adapted config is responsible for LAS-tile ingestion, declared class mapping, and prediction export. The inventory keeps the geometry-derived result separate until that adapter exists.
+* **Entrypoint bridge** (`infra_inventory/pointcept.py`): invokes Pointcept's real
+  `tools/test.py` with the upstream CLI contract (`--config-file`, `--num-gpus`,
+  `--options save_path=... weight=...`), verified against the upstream source.
+* **Dataset contract**: the pipeline exports per-tile LAS files that an adapted
+  Pointcept dataset class consumes (template:
+  `configs/pointcept/infra_ptv3_nuscenes.py.example`).
+* **Model**: PTv3 nuScenes semantic-segmentation checkpoint from the official
+  Hugging Face release (see `docs/MODEL_NOTES.md`), including the upstream
+  documented option to run without FlashAttention.
+* **Adaptation**: per-tile predictions are imported only through the documented
+  `class_mapping` table (`configs/model.yaml`), which maps upstream classes to
+  infrastructure evidence with explicit weights.
 
-[Point Transformer V3](https://github.com/Pointcept/PointTransformerV3) documents two modes: Pointcept-driven training/inference and a detached backbone that accepts a point dictionary. Its recommended environment includes CUDA and FlashAttention, while the repository also documents running without FlashAttention by setting `enable_flash=False` and reducing patch sizes. AI4Infra does not install, import, or require CUDA extensions for its default path.
+Not used:
+
+* No Pointcept code is copied into this repository. Pointcept stays an external,
+  versioned dependency used at runtime through `tools/test.py`.
+* No fake or "mock" model outputs; if the Pointcept environment is missing, the
+  backend reports it and the geometry pipeline still runs.
 
 ## RoadMarkingExtraction
 
-[RoadMarkingExtraction](https://github.com/YuePanEdward/RoadMarkingExtraction) is a C++ pipeline for MLS/ALS road-marking extraction, classification, and vectorization. Its documented command path accepts LAS or PCD input and emits vectorizable output after configuring a model pool. Its dependencies include PCL, OpenCV, LibLas, Eigen, and DXFLib.
+Used (real, documented):
 
-The portable `native-roadmarking-v1` stage in this repository is not a copy of that project. It measures near-ground, high-reflectance/RGB connected components directly from LAS data and records the exact method in each asset. A future adapter should run the external executable in a pinned environment, preserve its raw DXF/vector output, and create inventory assets with `detection_method: roadmarkingextraction-v1`.
+* **Adapter** (`infra_inventory/roadmarking.py`): stages per-tile LAS input, runs
+  the user's configured RoadMarkingExtraction run script, and parses the resulting
+  DXF vector output (LINE / LWPOLYLINE entities) into marking instances with
+  `detection_method: roadmarkingextraction-v1`.
+* The upstream build requirements (Eigen3, PCL, OpenCV, LibLas, DXFLib) are
+  documented in the adapter and procedure docs; the subsystem stays external.
+
+Not used:
+
+* The portable `native-roadmarking-v1` detector in this repository is original code;
+  it is a baseline, not a copy of the C++ project.
+* No C++ sources are vendored.
+
+## Original code in this repository
+
+Everything under `infra_inventory/` (except the thin bridges above), the
+configuration files, scripts, tests, and documentation are original to AI4Infra.
+This includes the streaming tile pipeline, the geometry detectors, the confidence
+engine, QC, exports, and the 3D viewer.
 
 ## Competition-specific contribution
 
-The competition layer is the inventory and attribution contract: object identity, source-tile and point provenance, measured attributes, confidence factors, CRS retention, and export artifacts. It is deliberately model-agnostic so a valid Pointcept fine-tuning run or specialist pavement result can improve detection without weakening auditability.
+The inventory and attribution contract is the competition layer: object identity,
+source-tile/point provenance, measured attributes, confidence factors, CRS
+retention, and export artifacts. It is deliberately model-agnostic so that a valid
+Pointcept fine-tuning run (docs/ENHANCEMENT.md) or a specialist pavement result
+improves accuracy without weakening auditability.

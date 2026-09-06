@@ -1,0 +1,107 @@
+# AI4Infra asset taxonomy
+#
+# Every detected object in the inventory is one of these classes. The subclass
+# refines the class. Unknown/unmeasurable attributes are exported as `null`,
+# never invented.
+#
+# The taxonomy mirrors the AI4Infra competition categories:
+#   1. Pavement  (travelled surface + painted markings)
+#   2. Utilities (poles, overhead conductors, cabinets, other)
+#   3. Signs     (panels + structures carrying them)
+#   4. Safety    (guardrails, barriers, rumble strips, other)
+
+taxonomy:
+  pavement:
+    subclasses: [travelled_surface]
+    id_prefix: PAV
+    color: "#6ba4ff"
+  pavement_marking:
+    subclasses: [lane_line, edge_line, stop_line, crosswalk, symbol, other]
+    id_prefix: MRK
+    color: "#f5cf58"
+  utility_pole:
+    subclasses: [vertical_support]
+    id_prefix: POL
+    color: "#b082f7"
+  overhead_conductor:
+    subclasses: [conductor]
+    id_prefix: CON
+    color: "#9aa7ff"
+  utility_cabinet:
+    subclasses: [cabinet]
+    id_prefix: CAB
+    color: "#c98af5"
+  traffic_sign:
+    subclasses: [panel_with_support, panel_only, sign_support]
+    id_prefix: SGN
+    color: "#ff7e9d"
+  guardrail:
+    subclasses: [roadside_barrier]
+    id_prefix: GRD
+    color: "#62e8b9"
+  safety_barrier:
+    subclasses: [concrete_barrier]
+    id_prefix: BAR
+    color: "#3dd6a8"
+  rumble_strip:
+    subclasses: [rumble_strip]
+    id_prefix: RUM
+    color: "#ffb46b"
+
+# Confidence weights per class (sums to 1.0 over the factors that are
+# measurable for that class; missing factors are renormalized at runtime).
+confidence_weights:
+  pavement:
+    model: 0.35
+    geometry: 0.30
+    support: 0.20
+    spatial_context: 0.15
+    class_consistency: 0.00
+  pavement_marking:
+    model: 0.25
+    geometry: 0.30
+    support: 0.20
+    spatial_context: 0.10
+    class_consistency: 0.15
+  utility_pole:
+    model: 0.25
+    geometry: 0.35
+    support: 0.20
+    spatial_context: 0.10
+    class_consistency: 0.10
+  overhead_conductor:
+    model: 0.20
+    geometry: 0.40
+    support: 0.20
+    spatial_context: 0.10
+    class_consistency: 0.10
+  utility_cabinet:
+    model: 0.20
+    geometry: 0.40
+    support: 0.20
+    spatial_context: 0.10
+    class_consistency: 0.10
+  traffic_sign:
+    model: 0.25
+    geometry: 0.35
+    support: 0.20
+    spatial_context: 0.10
+    class_consistency: 0.10
+  guardrail:
+    model: 0.30
+    geometry: 0.35
+    support: 0.15
+    spatial_context: 0.10
+    class_consistency: 0.10
+  safety_barrier:
+    model: 0.30
+    geometry: 0.35
+    support: 0.15
+    spatial_context: 0.10
+    class_consistency: 0.10
+  rumble_strip:
+    model: 0.00
+    geometry: 0.50
+    support: 0.20
+    spatial_context: 0.15
+    class_consistency: 0.15
