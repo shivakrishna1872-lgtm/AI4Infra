@@ -4,7 +4,8 @@ import csv
 import json
 from pathlib import Path
 
-from infra_inventory.models import ProcessingSettings
+from infra_inventory.export import _viewer_assets
+from infra_inventory.models import Asset, ProcessingSettings
 from infra_inventory.pipeline import process_las
 
 
@@ -82,6 +83,52 @@ def test_per_asset_files_match_inventory(synthetic_las: Path, output_dir: Path) 
         per_asset = json.loads((output_dir / "assets" / f"{asset['asset_id']}.json").read_text())
         assert per_asset["asset_id"] == asset["asset_id"]
         assert per_asset["class"] == asset["class"]
+
+
+def test_viewer_assets_cap_highlight_evidence() -> None:
+    """Viewer payload highlight points are capped per asset and globally."""
+    inventory = []
+    for index in range(40):
+        inventory.append({
+            "asset_id": f"MRK-{index:05d}",
+            "geometry": {"highlight_points": [[i, 0, 0] for i in range(500)]},
+        })
+    viewer_assets = _viewer_assets(inventory, max_highlight_points=24, global_cap=120)
+    total = sum(len(a["geometry"]["highlight_points"]) for a in viewer_assets)
+    for asset in viewer_assets:
+        assert len(asset["geometry"]["highlight_points"]) <= 24
+    assert total <= 120
+    # assets without highlight points are untouched
+    plain = _viewer_assets([{"asset_id": "X", "geometry": None}], 24, 120)
+    assert plain[0]["geometry"] is None
+
+
+def test_duplicate_qc_is_grid_based_and_flags_once() -> None:
+    """Nearby same-class assets flag the lower-confidence one exactly once."""
+    from infra_inventory.qc import run_quality_control
+
+    def asset(asset_id: str, x: float, confidence: float) -> Asset:
+        return Asset(
+            asset_id=asset_id, asset_class="pavement_marking", subclass="lane_line",
+            center={"x": x, "y": 0.0, "z": 0.0},
+            bounding_box=(x - 0.5, -0.5, 0.0, x + 0.5, 0.5, 0.05),
+            dimensions={"length_m": 1.0, "width_m": 0.15, "height_m": 0.05},
+            point_count=300, source_tile="tile_0_0", source_point_indices_sample=[],
+            coordinate_reference_system=None, confidence=confidence,
+            confidence_factors={}, confidence_explanation="", detection_method="test",
+        )
+
+    assets = [
+        asset("MRK-00001", 10.0, 0.95),
+        asset("MRK-00002", 10.4, 0.70),
+        asset("MRK-00003", 10.8, 0.60),
+        asset("MRK-00004", 500.0, 0.90),
+    ]
+    result, _report = run_quality_control(assets, ProcessingSettings())
+    by_id = {a.asset_id: a for a in result}
+    assert "LIKELY_DUPLICATE" not in by_id["MRK-00001"].qc_flags
+    assert "LIKELY_DUPLICATE" not in by_id["MRK-00004"].qc_flags
+    assert sum("LIKELY_DUPLICATE" in a.qc_flags for a in result) == 2  # the two losers
 
 
 def test_summary_report_lists_classes(synthetic_las: Path, output_dir: Path) -> None:

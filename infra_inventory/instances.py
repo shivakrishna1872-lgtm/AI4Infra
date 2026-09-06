@@ -76,21 +76,32 @@ def component_metrics(x: np.ndarray, y: np.ndarray, z: np.ndarray, indices: np.n
     hi = points.max(axis=0)
     bounds = (float(lo[0]), float(lo[1]), float(lo[2]), float(hi[0]), float(hi[1]), float(hi[2]))
     centroid = points.mean(axis=0)
-    cov = np.cov(points, rowvar=False)
-    eigenvalues, eigenvectors = np.linalg.eigh(cov)
-    eigenvalues = np.clip(eigenvalues, 0.0, None)
-    order = np.argsort(eigenvalues)
-    e0, e1, e2 = eigenvalues[order[0]], eigenvalues[order[1]], eigenvalues[order[2]]
-    # Dominant axis for elongated structures is the eigenvector of e2
-    dominant = eigenvectors[:, order[2]]
-    orientation = (math.degrees(math.atan2(dominant[1], dominant[0])) + 360) % 180
-    planarity = float((e1 - e0) / e2) if e2 > 1e-12 else 0.0
-    linearity = float((e2 - e1) / e2) if e2 > 1e-12 else 0.0
-    # Verticality: how vertical the dominant eigenvector is (0 horizontal .. 1 vertical)
-    verticality = float(abs(dominant[2])) if eigenvalues[order[2]] > 1e-12 else 0.0
-    # Columnarity: cross-section symmetry (e0 ~ e1). A vertical *column* (pole)
-    # has e0 ~ e1; a vertical *plane* (sign panel, wall) has e0 << e1.
-    columnarity = float(e0 / e1) if e1 > 1e-12 else 0.0
+    # Degenerate components (1-2 points, or zero variance along an axis) make
+    # np.cov/np.linalg.eigh raise on real-world tiles (USGS 3DEP airborne data
+    # is full of tiny fragments). Fall back to axis-aligned metrics instead of
+    # crashing the whole run.
+    planarity = linearity = verticality = columnarity = 0.0
+    orientation = 0.0
+    if len(points) >= 3 and np.isfinite(points).all():
+        try:
+            cov = np.cov(points, rowvar=False)
+            eigenvalues, eigenvectors = np.linalg.eigh(cov)
+            eigenvalues = np.clip(np.nan_to_num(eigenvalues, nan=0.0), 0.0, None)
+            if np.isfinite(eigenvalues).all():
+                order = np.argsort(eigenvalues)
+                e0, e1, e2 = eigenvalues[order[0]], eigenvalues[order[1]], eigenvalues[order[2]]
+                # Dominant axis for elongated structures is the eigenvector of e2
+                dominant = eigenvectors[:, order[2]]
+                orientation = (math.degrees(math.atan2(dominant[1], dominant[0])) + 360) % 180
+                planarity = float((e1 - e0) / e2) if e2 > 1e-12 else 0.0
+                linearity = float((e2 - e1) / e2) if e2 > 1e-12 else 0.0
+                # Verticality: how vertical the dominant eigenvector is (0 horizontal .. 1 vertical)
+                verticality = float(abs(dominant[2])) if eigenvalues[order[2]] > 1e-12 else 0.0
+                # Columnarity: cross-section symmetry (e0 ~ e1). A vertical *column* (pole)
+                # has e0 ~ e1; a vertical *plane* (sign panel, wall) has e0 << e1.
+                columnarity = float(e0 / e1) if e1 > 1e-12 else 0.0
+        except (np.linalg.LinAlgError, ValueError):  # pragma: no cover - defensive
+            pass
     return {
         "bounds": bounds,
         "length_m": float(hi[0] - lo[0]),

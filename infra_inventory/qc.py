@@ -86,20 +86,42 @@ def _flag_confidence(asset: Asset, settings: ProcessingSettings) -> None:
 
 
 def _flag_duplicates(assets: List[Asset], settings: ProcessingSettings) -> None:
-    """Flag same-class detections whose centroids are implausibly close."""
+    """Flag same-class detections whose centroids are implausibly close.
+
+    Grid-bucketed so the check stays O(n) even for tens of thousands of
+    detections (a full USGS 3DEP county tile yields ~10k assets; the previous
+    pairwise scan made the QC stage quadratic and effectively unbounded).
+    """
     by_class: Dict[str, List[Asset]] = {}
     for asset in assets:
         by_class.setdefault(asset.asset_class, []).append(asset)
     for group in by_class.values():
-        for i, a in enumerate(group):
-            for b in group[i + 1:]:
-                distance = _centroid_distance(a, b)
-                tolerance = max(settings.duplicate_distance_m, 0.12 * max(a.dimensions["length_m"], b.dimensions["length_m"]))
-                if distance <= tolerance:
-                    keeper = a if a.confidence >= b.confidence else b
-                    other = b if keeper is a else a
-                    other.qc_flags.append("LIKELY_DUPLICATE")
-                    other.flagged = True
+        if len(group) < 2:
+            continue
+        cell = max(settings.duplicate_distance_m, 1.0)
+        buckets: Dict[Tuple[int, int], List[Asset]] = {}
+        for asset in group:
+            key = (int(asset.center["x"] // cell), int(asset.center["y"] // cell))
+            buckets.setdefault(key, []).append(asset)
+        checked: set[int] = set()
+        for asset in group:
+            ax, ay = int(asset.center["x"] // cell), int(asset.center["y"] // cell)
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for other in buckets.get((ax + dx, ay + dy), ()):
+                        if id(other) <= id(asset) or id(other) in checked:
+                            continue
+                        distance = _centroid_distance(asset, other)
+                        tolerance = max(
+                            settings.duplicate_distance_m,
+                            0.12 * max(asset.dimensions["length_m"], other.dimensions["length_m"]),
+                        )
+                        if distance <= tolerance:
+                            keeper = asset if asset.confidence >= other.confidence else other
+                            loser = other if keeper is asset else asset
+                            loser.qc_flags.append("LIKELY_DUPLICATE")
+                            loser.flagged = True
+                            checked.add(id(loser))
 
 
 def _centroid_distance(a: Asset, b: Asset) -> float:

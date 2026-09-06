@@ -137,11 +137,17 @@ def read_metadata(path: str | Path) -> LasMetadata:
         raise MalformedLasError(str(exc)) from exc
 
 
-def iter_chunks(path: str | Path, chunk_size: int) -> Iterator[Tuple[LasMetadata, laspy.LasReader, LasChunk]]:
+def iter_chunks(path: str | Path, chunk_size: int, stride: int = 1) -> Iterator[Tuple[LasMetadata, laspy.LasReader, LasChunk]]:
     """Yield (metadata, reader, chunk) tuples without buffering the whole cloud.
 
     Yields the metadata once per chunk so callers can stream without keeping
     state; the reader is yielded so scale-aware dimensions are cheap.
+
+    ``stride > 1`` applies uniform per-chunk thinning (the streaming analogue of
+    LAStools' ``las2las -thin``): every ``stride``-th point of each decompressed
+    chunk is kept, so arbitrarily large files can be processed with bounded
+    memory and time while preserving the full spatial extent and per-chunk
+    global point offsets (``LasChunk.global_offset`` still counts source points).
     """
     path = Path(path).expanduser().resolve()
     if not path.is_file():
@@ -153,6 +159,12 @@ def iter_chunks(path: str | Path, chunk_size: int) -> Iterator[Tuple[LasMetadata
                 raise EmptyPointCloudError()
             global_offset = 0
             for raw_chunk in reader.chunk_iterator(chunk_size):
+                chunk_length = len(raw_chunk)
+                if stride > 1:
+                    # LAStools-style uniform thinning inside the chunk. Slicing the
+                    # point record keeps scale-aware dimensions intact; memory stays
+                    # bounded by chunk_size / stride points.
+                    raw_chunk = raw_chunk[::stride]
                 names = set(raw_chunk.point_format.dimension_names)
                 x = np.asarray(raw_chunk.x, dtype=np.float64)
                 y = np.asarray(raw_chunk.y, dtype=np.float64)
@@ -184,7 +196,7 @@ def iter_chunks(path: str | Path, chunk_size: int) -> Iterator[Tuple[LasMetadata
                     classification=(np.asarray(raw_chunk.classification, dtype=np.int64) if "classification" in names else None),
                     global_offset=global_offset,
                 )
-                global_offset += len(x)
+                global_offset += chunk_length
                 yield metadata, reader, chunk
     except EmptyPointCloudError:
         raise

@@ -187,6 +187,33 @@ In the web app, drag the `.laz`/`.las` into the upload zone or use
 `POST /api/projects/{id}/upload` + `POST /api/projects/{id}/process`. Jobs are
 persisted to disk, so backend restarts never lose them.
 
+## 14b. Legacy LAS versions (1.0 / 1.1) and very large tiles
+
+The reader follows the approach of [LAStools](https://github.com/LAStools/LAStools)
+for files its own tooling cannot write natively:
+
+* **Chunked decompression**: `.laz` is decoded in streaming chunks through
+  laspy's `lazrs` backend — the same LASzip codec LAStools uses — so a file is
+  never held in memory whole.
+* **Header re-versioning** (las2las analogue): laspy cannot *write* LAS 1.0
+  headers, which crashed older USGS 3DEP tiles at the first 500k-point chunk
+  (`FileVersionNotSupported: 1.0`). Tiles are now written with a writable LAS
+  version while preserving scales, offsets, point format and every dimension;
+  the input file is never modified and the re-version is recorded as a warning.
+* **Uniform thinning** (`--max-input-points N`, the `las2las -thin` analogue):
+  inputs larger than `N` points are uniformly decimated inside each streaming
+  chunk, bounding memory and time for multi-hundred-million-point tiles while
+  keeping the full spatial extent. Off for competition mobile data by default
+  (0 = process every point); `summary.point_count` always reports the true
+  input count and a warning states the thinning.
+
+```bash
+# a 2006 USGS 3DEP tile (LAS 1.0, PDR 1, ~16M points) — previously crashed:
+python -m infra_inventory process TX_BurnetCo_2006_000014.las --output output/burnet
+# same file, bounded to ~2M points for quick analysis:
+python -m infra_inventory process TX_BurnetCo_2006_000014.las --output output/burnet --max-input-points 2000000
+```
+
 ## 15. Simulation & automated validation
 
 Quick Simulation (zero data) generates a synthetic mobile-LiDAR corridor and

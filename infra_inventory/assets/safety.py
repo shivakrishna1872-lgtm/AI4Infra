@@ -157,7 +157,21 @@ def _group_bands(bands: List[dict], max_gap_m: float) -> List[List[dict]]:
             for band in list(remaining):
                 if any(math.hypot(band["cx"] - member["cx"], band["cy"] - member["cy"]) <= max_gap_m for member in group):
                     group.append(band)
-                    remaining.remove(band)
+                    _remove_by_identity(remaining, band)
                     changed = True
         groups.append(group)
     return groups
+
+
+def _remove_by_identity(items: List[dict], target: dict) -> None:
+    """Remove ``target`` by object identity.
+
+    Band dicts carry numpy arrays (``indices``); ``list.remove`` compares with
+    ``==``, which makes numpy raise a broadcast error when two bands have
+    different point counts (seen on real airborne tiles, e.g. Burnet County
+    USGS 3DEP).
+    """
+    for index, item in enumerate(items):
+        if item is target:
+            items.pop(index)
+            return

@@ -107,7 +107,7 @@ machine. See [`docs/upstream-integration.md`](docs/upstream-integration.md) and
 
 | Stage | Implementation |
 | --- | --- |
-| LAS ingestion | Streaming chunks through `laspy`; never loads the whole cloud blindly |
+| LAS ingestion | Streaming chunks through `laspy` (`lazrs` LASzip codec for `.laz`, LAStools-style); legacy LAS 1.0/1.1 inputs are re-versioned for tile writes, never modified; optional uniform thinning (`--max-input-points`) for huge airborne tiles |
 | Validation | LAS version / point format / CRS / dimensions / bounds, with fix hints (`validate` command) |
 | CRS | Read from LAS metadata (`EPSG:XXXX`); `CRS_UNRESOLVED` when absent — never assumed |
 | Tiling | Spatial tiles persisted as per-tile LAS files (append mode, single pass) |

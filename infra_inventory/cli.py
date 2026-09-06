@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from functools import partial
@@ -59,7 +60,8 @@ def _merge_settings(args: argparse.Namespace) -> ProcessingSettings:
     # CLI flags override YAML
     for name in ("chunk_size", "tile_size", "viewer_points", "strict_las14", "backend",
                  "pointcept_root", "pointcept_config", "pointcept_weight", "pointcept_class_names",
-                 "pointcept_num_gpus", "roadmarking_command", "roadmarking_config"):
+                 "pointcept_num_gpus", "roadmarking_command", "roadmarking_config",
+                 "max_input_points"):
         if name in ("tile_size", "viewer_points"):
             field = "tile_size_m" if name == "tile_size" else "viewer_point_limit"
             value = getattr(args, name, None)
@@ -156,7 +158,12 @@ def _tile(args: argparse.Namespace) -> int:
         with laspy.open(path) as reader:
             source_header = reader.header
         tile_names: list[str] = []
-        for _, _, chunk in iter_chunks(path, settings.chunk_size):
+        input_stride = 1
+        if settings.max_input_points:
+            input_stride = max(2, math.ceil(
+                int(laspy.open(path).header.point_count) / settings.max_input_points
+            ))
+        for _, _, chunk in iter_chunks(path, settings.chunk_size, stride=input_stride):
             tx = np.floor(chunk.x / settings.tile_size_m).astype(np.int64)
             ty = np.floor(chunk.y / settings.tile_size_m).astype(np.int64)
             for key in np.unique(np.column_stack((tx, ty)), axis=0):
@@ -267,6 +274,8 @@ def build_parser() -> argparse.ArgumentParser:
     process.add_argument("--chunk-size", type=int, help="Streaming chunk size (points)")
     process.add_argument("--tile-size", type=float, help="Spatial tile edge (metres)")
     process.add_argument("--viewer-points", type=int, help="Points sampled for the 3D viewer")
+    process.add_argument("--max-input-points", dest="max_input_points", type=int, default=0,
+                        help="Uniformly thin inputs larger than this many points (0 = process all)")
     process.add_argument("--strict-las14", action="store_true", help="Fail on non-LAS-1.4 input")
     process.add_argument("--backend", choices=("geometry", "pointcept"), help="Inference backend")
     process.add_argument("--pointcept-root", help="Path to the Pointcept checkout")
@@ -292,6 +301,8 @@ def build_parser() -> argparse.ArgumentParser:
     tile = subparsers.add_parser("tile", help="Tiling stage only")
     tile.add_argument("input", help="Input LAS/LAZ file")
     tile.add_argument("--output", required=True, help="Output tiles directory")
+    tile.add_argument("--max-input-points", dest="max_input_points", type=int, default=0,
+                      help="Uniformly thin inputs larger than this many points (0 = process all)")
     tile.add_argument("--config", help="YAML processing config")
     tile.add_argument("--chunk-size", type=int)
     tile.add_argument("--tile-size", type=float)

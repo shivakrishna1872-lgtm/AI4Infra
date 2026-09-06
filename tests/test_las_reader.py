@@ -32,6 +32,23 @@ def test_streaming_chunks_preserve_points(synthetic_las: Path) -> None:
     assert chunks >= 3  # ~10k points / 4k chunk size
 
 
+def test_streaming_chunks_stride_thins_and_counts_source_points(synthetic_las: Path) -> None:
+    """LAStools las2las -thin analogue: stride keeps every Nth point per chunk,
+    and global offsets still count source points so provenance stays truthful."""
+    full = [(len(chunk.x), chunk.global_offset) for _, _, chunk in iter_chunks(synthetic_las, chunk_size=4_000)]
+    thinned = [(len(chunk.x), chunk.global_offset) for _, _, chunk in iter_chunks(synthetic_las, chunk_size=4_000, stride=3)]
+    assert all(length < full_length for (length, _), (full_length, _) in zip(thinned, full))
+    # global offsets keep counting source points (monotonic, non-overlapping)
+    offsets = [offset for _, offset in thinned]
+    assert offsets == sorted(offsets)
+    assert offsets[0] == 0
+    # thinning keeps a strict minority of every chunk
+    total_source = read_metadata(synthetic_las).point_count
+    total_kept = sum(length for length, _ in thinned)
+    assert total_kept < total_source
+    assert total_kept >= total_source // 3 - 10  # stride 3 keeps ~1/3 of points
+
+
 def test_streaming_chunks_global_offsets(synthetic_las: Path) -> None:
     offsets = []
     for _, _, chunk in iter_chunks(synthetic_las, chunk_size=10_000):

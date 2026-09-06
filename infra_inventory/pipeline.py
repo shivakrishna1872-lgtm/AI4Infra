@@ -77,9 +77,26 @@ def _elevation_color(z01: np.ndarray) -> List[List[float]]:
 
 
 def _tile_header(source_header: laspy.LasHeader) -> laspy.LasHeader:
-    try:
-        header = laspy.LasHeader(point_format=source_header.point_format, version=source_header.version)
-    except TypeError:  # pragma: no cover - older laspy
+    """Build a header for an internal tile file, upgrading the LAS version when
+    the source version cannot be written.
+
+    laspy cannot *create* headers for LAS 1.0 (and some 1.1) files even though
+    it reads them fine - old USGS 3DEP tiles (e.g. Burnet County 2006) are often
+    LAS 1.0 / point format 1. Without this upgrade, tiling dies on the first
+    chunk with ``FileVersionNotSupported: 1.0`` (surfacing to users as the
+    cryptic "Processing failed: 1.0"). Tile files are internal artifacts, so
+    upgrading to the oldest writable version that supports the point format is
+    lossless: scales, offsets, dimensions and VLRs are preserved.
+    """
+    for version in (str(source_header.version), "1.2", "1.3", "1.4"):
+        try:
+            header = laspy.LasHeader(
+                point_format=source_header.point_format, version=version
+            )
+            break
+        except Exception:  # pragma: no cover - laspy version quirks
+            continue
+    else:  # pragma: no cover - defensive; 1.4 covers every PDR
         header = laspy.LasHeader(point_format=int(source_header.point_format.id), version="1.4")
     header.scales = list(source_header.scales)
     header.offsets = list(source_header.offsets)
@@ -139,10 +156,26 @@ def _stream_tiles(
     z0, _, _, z1, _, _ = metadata.bounds
 
     sample_stride = max(1, math.ceil(metadata.point_count / settings.viewer_point_limit))
+    input_stride = 1
+    if settings.max_input_points and metadata.point_count > settings.max_input_points:
+        input_stride = max(2, math.ceil(metadata.point_count / settings.max_input_points))
+        thinned = metadata.point_count // input_stride
+        warnings.append(
+            f"Input thinned uniformly to ~{thinned:,} points (max_input_points="
+            f"{settings.max_input_points:,}, stride {input_stride}). The inventory is "
+            "measured from the thinned cloud; source point counts are approximate."
+        )
     processed = 0
     with laspy.open(input_path) as reader:
+        tile_header = _tile_header(reader.header)
+        if str(reader.header.version) != str(tile_header.version):
+            warnings.append(
+                f"Input LAS {reader.header.version} is not writable by laspy; tiles are "
+                f"written as LAS {tile_header.version} (scales/offsets/dimensions preserved). "
+                "This only affects internal tile files, never the input."
+            )
         source_header = reader.header
-        for chunk_number, (_, _, chunk) in enumerate(iter_chunks(input_path, settings.chunk_size)):
+        for chunk_number, (_, _, chunk) in enumerate(iter_chunks(input_path, settings.chunk_size, stride=input_stride)):
             x, y, z = chunk.x, chunk.y, chunk.z
             processed += len(x)
             if progress:

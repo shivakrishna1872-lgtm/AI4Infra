@@ -97,6 +97,11 @@ class ProcessingSettings:
     viewer_point_limit: int = 250_000
     point_index_sample_limit: int = 256
     save_tiles: bool = True
+    # Uniform input thinning (LAStools las2las -thin analogue): when > 0 and the
+    # input exceeds this many points, every stride-th point is kept per chunk so
+    # very large files (e.g. airborne 3DEP tiles) process with bounded memory.
+    # 0 = process every point (recommended for mobile competition data).
+    max_input_points: int = 0
 
     # --- Backends ---
     backend: str = "geometry"  # "geometry" | "pointcept"

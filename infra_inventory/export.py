@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -82,9 +83,13 @@ def write_outputs(
     (output / "reports" / "summary.md").write_text(_summary_markdown(run, inventory, qc_report), encoding="utf-8")
 
     # --- Viewer data -------------------------------------------------------------
+    # The browser payload must stay small: assets keep all metadata, but their
+    # source-point evidence (highlight_points) is capped. Full evidence stays in
+    # assets.json / inventory.json / per-asset files - the viewer only needs a
+    # representative sample for highlighting.
     viewer_data = {
         "run": run,
-        "assets": inventory,
+        "assets": _viewer_assets(inventory, max_highlight_points=24, global_cap=120_000),
         "points": viewer.get("points", []),
         "point_colors": viewer.get("point_colors", []),
         "point_rgb": viewer.get("point_rgb"),
@@ -93,6 +98,33 @@ def write_outputs(
         "point_class_names": viewer.get("point_class_names", []),
     }
     (output / "viewer-data.json").write_text(json.dumps(viewer_data), encoding="utf-8")
+
+
+def _viewer_assets(inventory: List[dict], max_highlight_points: int, global_cap: int) -> List[dict]:
+    """Assets for the viewer payload with bounded highlight-point evidence."""
+    capped: List[tuple[dict, Optional[List[Any]]]] = []
+    total = 0
+    for asset in inventory:
+        geometry = asset.get("geometry")
+        points = geometry.get("highlight_points") if isinstance(geometry, dict) else None
+        sample = None
+        if points:
+            stride = max(1, math.ceil(len(points) / max_highlight_points))
+            sample = points[::stride][:max_highlight_points]
+            total += len(sample)
+        capped.append((asset, sample))
+    # If the combined evidence still exceeds the payload budget, thin every
+    # asset's sample uniformly (still representative, still ordered).
+    global_stride = max(1, math.ceil(total / global_cap)) if total > global_cap else 1
+    result: List[dict] = []
+    for asset, sample in capped:
+        copy = dict(asset)
+        if sample:
+            geometry = dict(copy["geometry"])
+            geometry["highlight_points"] = sample[::global_stride]
+            copy["geometry"] = geometry
+        result.append(copy)
+    return result
 
 
 def _ensure_subdirs(output: Path) -> None:
