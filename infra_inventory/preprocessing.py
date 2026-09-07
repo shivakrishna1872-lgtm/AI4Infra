@@ -7,11 +7,49 @@ the measurable inputs every geometry detector is built on.
 """
 from __future__ import annotations
 
+import math
 from typing import Dict, Optional, Tuple
 
 import numpy as np
 
 from .models import ProcessingSettings
+
+
+def voxel_downsample(
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray,
+    target: int,
+    min_cell_m: float = 0.05,
+    max_cell_m: float = 8.0,
+) -> np.ndarray:
+    """Spatial LOD: keep the first point of every occupied voxel, ~``target`` cells.
+
+    This is the LAStools ``las2las -thin``-style spatial decimation the viewer
+    needs: uniform *strided* sampling keeps the densest areas over-represented
+    and can still ship tens of megabytes of a multi-gigabyte cloud, while a
+    voxel grid guarantees one point per cell of space - the background cloud
+    covers the whole scene at bounded size. Deterministic (first point per
+    voxel, input order preserved), vectorized, and memory-bounded.
+
+    The cell edge is chosen so a surface-dominant scene yields ~``target``
+    occupied cells (``cell = sqrt(horizontal_extent / target)``); 3-D clutter
+    (poles, wires) simply adds fewer cells than the target.
+
+    Returns the kept point indices (a subset of ``np.arange(len(x))``).
+    """
+    if len(x) == 0:
+        return np.zeros(0, dtype=np.int64)
+    extent_x = float(np.ptp(x))
+    extent_y = float(np.ptp(y))
+    area = max(extent_x * extent_y, 1e-6)
+    cell = min(max(math.sqrt(area / max(target, 1)), min_cell_m), max_cell_m)
+    ix = np.floor((x - float(np.min(x))) / cell).astype(np.int64)
+    iy = np.floor((y - float(np.min(y))) / cell).astype(np.int64)
+    iz = np.floor((z - float(np.min(z))) / cell).astype(np.int64)
+    cells = np.column_stack((ix, iy, iz))
+    _, first = np.unique(cells, axis=0, return_index=True)
+    return np.sort(first)
 
 
 def tile_keys(x: np.ndarray, y: np.ndarray, tile_size_m: float) -> Tuple[np.ndarray, np.ndarray]:

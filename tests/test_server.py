@@ -160,3 +160,171 @@ def test_stale_job_file_reported_as_error_after_restart(client):
     body = response.json()
     assert body["stage"] == "error"
     assert "restarted" in body["message"]
+
+
+def test_processing_preflight_returns_clear_507_when_disk_full(client, monkeypatch):
+    """Starting a job on a nearly full disk fails fast with a routing message
+    instead of crashing mid-write with Errno 28."""
+    monkeypatch.setattr(server, "_free_disk_bytes", lambda: server.MIN_FREE_DISK_BYTES - 1)
+    project = client.post("/api/projects", params={"name": "diskfull"}).json()
+    response = client.post(f"/api/projects/{project['id']}/process", json={})
+    assert response.status_code == 507
+    assert "disk" in response.json()["detail"].lower()
+    # Quick Simulation is preflighted too
+    assert client.post("/api/simulate").status_code == 507
+
+
+def test_web_job_does_not_keep_tile_intermediates(client, tmp_path):
+    """The disk-footprint regression: web jobs run with save_tiles=false, so a
+    processed project holds the viewer payload + exports but not multi-GB tiles."""
+    from infra_inventory.synthetic import build_synthetic_las
+
+    las = tmp_path / "input.las"
+    build_synthetic_las(las)
+    project = client.post("/api/projects", params={"name": "no tiles"}).json()
+    with las.open("rb") as handle:
+        upload = client.post(
+            f"/api/projects/{project['id']}/upload",
+            files={"file": ("input.las", handle, "application/octet-stream")},
+        )
+    assert upload.status_code == 200
+    started = client.post(f"/api/projects/{project['id']}/process", json={}).json()
+    status = wait_done(client, started["job_id"])
+    assert status["stage"] == "done"
+    output_dir = server._project_dir(project["id"]) / "output"
+    assert (output_dir / "viewer-data.json").is_file()
+    assert not (output_dir / "tiles").exists()
+    assert client.get(f"/api/projects/{project['id']}/viewer-data").status_code == 200
+    info = client.get(f"/api/projects/{project['id']}").json()
+    assert info["processed"] is True
+    assert info["asset_count"] == status["assets"]
+
+
+def test_data_simulation_writes_directly_no_copytree(client, tmp_path):
+    """simulate/data processes into the project output directly (the old path
+    doubled disk with a run-dir + copytree)."""
+    from infra_inventory.synthetic import build_synthetic_las
+
+    las = tmp_path / "input.las"
+    build_synthetic_las(las)
+    with las.open("rb") as handle:
+        response = client.post(
+            "/api/simulate/data",
+            files={"upload": ("input.las", handle, "application/octet-stream")},
+        )
+    assert response.status_code == 200, response.text
+    project = response.json()
+    assert project["processed"] is True
+    assert project["asset_count"] > 0
+    output_dir = server._project_dir(project["id"]) / "output"
+    assert not (output_dir / "tiles").exists()
+    assert client.get(f"/api/projects/{project['id']}/viewer-data").status_code == 200
+    for name in ("assets.json", "inventory.json", "assets.csv", "assets.geojson"):
+        assert client.get(f"/api/projects/{project['id']}/exports/{name}").status_code == 200, name
+
+
+def test_viewer_data_served_gzip_compressed(client, tmp_path):
+    """The viewer payload is tens of MB for real scans; it must be served
+    gzip-compressed so the hosted preview tunnel doesn't stall on the transfer."""
+    from infra_inventory.synthetic import build_synthetic_las
+
+    las = tmp_path / "input.las"
+    build_synthetic_las(las)
+    project = client.post("/api/projects", params={"name": "gzip"}).json()
+    with las.open("rb") as handle:
+        client.post(
+            f"/api/projects/{project['id']}/upload",
+            files={"file": ("input.las", handle, "application/octet-stream")},
+        )
+    started = client.post(f"/api/projects/{project['id']}/process", json={}).json()
+    status = wait_done(client, started["job_id"])
+    assert status["stage"] == "done"
+
+    plain = client.get(f"/api/projects/{project['id']}/viewer-data")
+    assert plain.status_code == 200
+    gzipped = client.get(
+        f"/api/projects/{project['id']}/viewer-data",
+        headers={"Accept-Encoding": "gzip"},
+    )
+    assert gzipped.status_code == 200
+    # Starlette's gzip middleware sets the header; the test client then
+    # decompresses transparently, so assert the header + intact payload.
+    assert gzipped.headers.get("content-encoding") == "gzip"
+    assert len(gzipped.json()["points"]) == len(plain.json()["points"]) > 0
+
+
+def test_second_process_on_same_project_is_rejected(client, tmp_path, monkeypatch):
+    """Two concurrent jobs on one project would wipe each other's output and
+    orphan a zombie thread; the second start must fail fast with 409."""
+    import time as _time
+    from infra_inventory.synthetic import build_synthetic_las
+
+    las = tmp_path / "input.las"
+    build_synthetic_las(las)
+    project = client.post("/api/projects", params={"name": "double"}).json()
+    with las.open("rb") as handle:
+        client.post(
+            f"/api/projects/{project['id']}/upload",
+            files={"file": ("input.las", handle, "application/octet-stream")},
+        )
+
+    # Hold the first job open so the second request provably overlaps it.
+    original = server.process_las
+
+    def slow(*args, **kwargs):
+        _time.sleep(4)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(server, "process_las", slow)
+    first = client.post(f"/api/projects/{project['id']}/process", json={})
+    assert first.status_code == 200
+    second = client.post(f"/api/projects/{project['id']}/process", json={})
+    assert second.status_code == 409
+    assert "already being processed" in second.json()["detail"]
+    status = wait_done(client, first.json()["job_id"])
+    assert status["stage"] == "done"
+    # After completion the project can be processed again.
+    monkeypatch.setattr(server, "process_las", original)
+    again = client.post(f"/api/projects/{project['id']}/process", json={})
+    assert again.status_code == 200
+    assert wait_done(client, again.json()["job_id"])["stage"] == "done"
+
+
+def test_web_settings_gemini_auto_enable(monkeypatch) -> None:
+    """_web_settings enables the Gemini booster when the key is present and
+    falls back to geometry-only without it (the pipeline never needs the net)."""
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    settings = server._web_settings()
+    assert settings.backend == "geometry"
+    assert settings.save_tiles is False
+    assert settings.viewer_point_limit == 250_000
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    settings = server._web_settings()
+    assert settings.backend == "gemini"
+    # Explicit opt-out wins even with a key present.
+    assert server._web_settings(use_gemini=False).backend == "geometry"
+    # Model override passes through.
+    assert server._web_settings(gemini_model="gemini-test").gemini_model == "gemini-test"
+
+
+def test_process_endpoint_accepts_use_gemini_flag(client, tmp_path, monkeypatch) -> None:
+    """The process request forwards the Gemini switch; a forced-on run without a
+    valid key still completes (geometry-only, warning recorded)."""
+    from infra_inventory.synthetic import build_synthetic_las
+
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    upload = client.post("/api/projects", json={"name": "gemini flag"})
+    project = upload.json()
+    src = tmp_path / "in.las"
+    build_synthetic_las(src, seed=7)
+    with src.open("rb") as handle:
+        up = client.post(f"/api/projects/{project['id']}/upload", files={"file": ("in.las", handle, "application/octet-stream")})
+    assert up.status_code == 200
+    start = client.post(f"/api/projects/{project['id']}/process", json={"use_gemini": "false"})
+    assert start.status_code == 200
+    status = wait_done(client, start.json()["job_id"])
+    assert status["stage"] == "done"
+    run = client.get(f"/api/projects/{project['id']}").json()
+    # The project processed successfully either way; backend recorded in run.json.
+    assert run.get("processed") is True

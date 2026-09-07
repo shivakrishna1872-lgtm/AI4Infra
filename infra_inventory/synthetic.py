@@ -65,6 +65,8 @@ def _intensity_for(kind: str, rng: np.random.Generator) -> np.ndarray:
         "guardrail": (900, 1500),
         "guardrail_post": (800, 1200),
         "concrete_barrier": (500, 900),
+        "cabinet": (900, 1600),
+        "rumble": (22000, 30000),
     }
     lo, hi = tables.get(kind, (500, 1000))
     return rng.integers(lo, hi, 1).astype(np.float64)[0]
@@ -85,6 +87,8 @@ def _rgb_for(kind: str, rng: np.random.Generator) -> np.ndarray:
         "guardrail": (33000, 33000, 34000),
         "guardrail_post": (30000, 30000, 31000),
         "concrete_barrier": (26000, 26000, 27000),
+        "cabinet": (32000, 32000, 33000),
+        "rumble": (52000, 52000, 52000),
     }
     base = np.array(tables.get(kind, (8000, 8000, 8000)), dtype=np.int64)
     jitter = rng.integers(-400, 400, 3)
@@ -139,7 +143,36 @@ def _crossarm_points(px: float, py: float, rng: np.random.Generator):
             np.tile(_rgb_for("crossarm", rng), (n, 1)))
 
 
+def _occlusion_gaps(n: int, rng: np.random.Generator, per_point_noise: float = 0.01) -> np.ndarray:
+    """Realistic scanner dropout along a continuous 1-D chain.
+
+    Per-point speckle dropout breaks a chain every ~1/p points regardless of how
+    low the rate is (4% -> ~9 m runs), which no real scanner produces. Real
+    occlusion comes in contiguous shadowed stretches (foliage, the pole/crossarm
+    itself blocking the beam), so we drop 1-2 contiguous runs of 1.5-4 m and add
+    only a hair of per-point noise.
+    """
+    keep = np.ones(n, dtype=bool)
+    n_gaps = int(rng.integers(1, 3))
+    for _ in range(n_gaps):
+        center = rng.uniform(0.10, 0.90) * n
+        half = rng.uniform(1.0, 2.5) / 0.35 / 2.0  # metres -> samples
+        lo = max(0, int(center - half))
+        hi = min(n, int(center + half))
+        if hi > lo:
+            keep[lo:hi] = False
+    keep &= rng.random(n) > per_point_noise
+    return keep
+
+
 def _conductor_points(p1: tuple[float, float], p2: tuple[float, float], rng: np.random.Generator):
+    """Overhead wire between two pole tops, sampled continuously along the drive.
+
+    A mobile mapper records a wire as a near-continuous chain (the scanner
+    tracks it along the road), so dropout is contiguous occlusion stretches of
+    a few metres, never per-point speckle (which would fragment a 1-D chain
+    into sub-metre runs no scanner produces).
+    """
     (px1, py1), (px2, py2) = p1, p2
     dist = math.hypot(px2 - px1, py2 - py1)
     steps = max(2, int(dist / 0.35))
@@ -148,7 +181,7 @@ def _conductor_points(p1: tuple[float, float], p2: tuple[float, float], rng: np.
     cx = px1 + (px2 - px1) * t
     cy = py1 + (py2 - py1) * t
     cz = 10.2 - sag * 4 * t * (1 - t) + rng.normal(0.0, 0.03, t.shape)
-    keep = _scatter_dropout(np.ones(t.shape, dtype=bool), rng, 0.35)
+    keep = _occlusion_gaps(len(t), rng)
     n = int(keep.sum())
     return (cx[keep], cy[keep], cz[keep],
             np.full(n, _intensity_for("conductor", rng)),
@@ -176,6 +209,62 @@ def _guardrail_mesh(start_x: float, end_x: float, side: float, rng: np.random.Ge
         parts[3].append(np.full(nz, _intensity_for("guardrail_post", rng)))
         parts[4].append(np.tile(_rgb_for("guardrail_post", rng), (nz, 1)))
     return tuple(np.concatenate(p) for p in parts)
+
+
+def _cabinet_mesh(x0: float, y0: float, width: float, depth: float, height: float, rng: np.random.Generator):
+    """Compact utility cabinet: dense points on four sides + top, base on ground."""
+    z0 = 0.02
+    xs: List[float] = []
+    ys: List[float] = []
+    zs: List[float] = []
+
+    def face(px: np.ndarray, py: np.ndarray, pz: np.ndarray) -> None:
+        mask = _scatter_dropout(np.ones(px.shape, dtype=bool), rng, 0.22)
+        xs.extend(px[mask]); ys.extend(py[mask]); zs.extend(pz[mask])
+
+    face(np.full_like(np.arange(y0, y0 + depth, 0.045), x0),
+         np.arange(y0, y0 + depth, 0.045),
+         np.full_like(np.arange(y0, y0 + depth, 0.045), z0 + height / 2))
+    face(np.full_like(np.arange(y0, y0 + depth, 0.045), x0 + width),
+         np.arange(y0, y0 + depth, 0.045),
+         np.full_like(np.arange(y0, y0 + depth, 0.045), z0 + height / 2))
+    for xc in (x0, x0 + width):
+        ys_ = np.arange(y0, y0 + depth, 0.045)
+        zs_ = np.arange(z0, z0 + height, 0.09)
+        face(np.full((len(zs_), len(ys_)), xc), np.broadcast_to(ys_, (len(zs_), len(ys_))),
+             np.broadcast_to(zs_[:, None], (len(zs_), len(ys_))))
+    for yc in (y0, y0 + depth):
+        xs_ = np.arange(x0, x0 + width, 0.045)
+        zs_ = np.arange(z0, z0 + height, 0.09)
+        face(np.broadcast_to(xs_, (len(zs_), len(xs_))), np.full((len(zs_), len(xs_)), yc),
+             np.broadcast_to(zs_[:, None], (len(zs_), len(xs_))))
+    xs_ = np.arange(x0, x0 + width, 0.045)
+    ys_ = np.arange(y0, y0 + depth, 0.045)
+    face(np.broadcast_to(xs_, (len(ys_), len(xs_))), np.broadcast_to(ys_[:, None], (len(ys_), len(xs_))),
+         np.full((len(ys_), len(xs_)), z0 + height))
+
+    n = len(xs)
+    return (np.array(xs), np.array(ys), np.array(zs),
+            np.full(n, _intensity_for("cabinet", rng)),
+            np.tile(_rgb_for("cabinet", rng), (n, 1)))
+
+
+def _rumble_bands_mesh(x_start: float, n_bands: int, spacing: float, y0: float, length: float, rng: np.random.Generator):
+    """Short bright transverse bands on the shoulder (rumble strip signature)."""
+    xs: List[float] = []
+    ys: List[float] = []
+    for band in range(n_bands):
+        xc = x_start + band * spacing
+        bx = np.arange(xc - 0.13, xc + 0.13, 0.05)
+        by = np.arange(y0, y0 + length, 0.05)
+        px = np.broadcast_to(bx, (len(by), len(bx)))
+        py = np.broadcast_to(by[:, None], (len(by), len(bx)))
+        mask = _scatter_dropout(np.ones(px.shape, dtype=bool), rng, 0.2)
+        xs.extend(px[mask]); ys.extend(py[mask])
+    n = len(xs)
+    return (np.array(xs), np.array(ys), np.full(n, 0.015),
+            np.full(n, _intensity_for("rumble", rng)),
+            np.tile(_rgb_for("rumble", rng), (n, 1)))
 
 
 def _concrete_barrier_mesh(x0: float, x1: float, y_center: float, rng: np.random.Generator):
@@ -336,12 +425,28 @@ def build_simulated_las(
     bxx, byy, bzz, bi, brgb = _concrete_barrier_mesh(340.0, 380.0, 5.5, rng)
     parts["concrete_barrier"] = {"points": len(bxx), "note": "40 m Jersey-style barrier"}
 
+    # ---- utility cabinets + rumble strips ----------------------------------------
+    cab_x_all, cab_y_all, cab_z_all, cab_i_all, cab_rgb_all = [], [], [], [], []
+    for (cx0, cy0) in ((140.0, -5.2), (220.0, 5.2)):
+        cx_, cy_, cz_, ci_, crgb_ = _cabinet_mesh(cx0, cy0, 0.9, 0.7, 1.3, rng)
+        cab_x_all.append(cx_); cab_y_all.append(cy_); cab_z_all.append(cz_)
+        cab_i_all.append(ci_); cab_rgb_all.append(crgb_)
+    cab_x = np.concatenate(cab_x_all); cab_y = np.concatenate(cab_y_all)
+    cab_z = np.concatenate(cab_z_all); cab_i = np.concatenate(cab_i_all)
+    cab_rgb = np.concatenate(cab_rgb_all)
+    parts["utility_cabinets"] = {"points": len(cab_x), "count": 2, "note": "0.9 x 0.7 x 1.3 m boxes"}
+
+    # Bands sit clear of the 3.0 m edge line so the marking detector never
+    # merges them into one long component at 0.25 m grid resolution.
+    rum_x, rum_y, rum_z, rum_i, rum_rgb = _rumble_bands_mesh(215.0, 6, 0.9, 3.6, 0.6, rng)
+    parts["rumble_strips"] = {"points": len(rum_x), "count": 6, "note": "transverse bands on the shoulder"}
+
     # ---- assemble ----------------------------------------------------------------
-    x = np.concatenate([ground_x, mark_x, pole_x, con_x, sign_x, rail_x, bxx])
-    y = np.concatenate([ground_y, mark_y, pole_y, con_y, sign_y, rail_y, byy])
-    z = np.concatenate([ground_z, mark_z, pole_z, con_z, sign_z, rail_z, bzz])
-    intensity = np.concatenate([ground_i, mark_i, pole_i, con_i, sign_i, rail_i, bi])
-    rgb = np.concatenate([ground_rgb, mark_rgb, pole_rgb, con_rgb, sign_rgb, rail_rgb, brgb]).astype(np.uint16)
+    x = np.concatenate([ground_x, mark_x, pole_x, con_x, sign_x, rail_x, bxx, cab_x, rum_x])
+    y = np.concatenate([ground_y, mark_y, pole_y, con_y, sign_y, rail_y, byy, cab_y, rum_y])
+    z = np.concatenate([ground_z, mark_z, pole_z, con_z, sign_z, rail_z, bzz, cab_z, rum_z])
+    intensity = np.concatenate([ground_i, mark_i, pole_i, con_i, sign_i, rail_i, bi, cab_i, rum_i])
+    rgb = np.concatenate([ground_rgb, mark_rgb, pole_rgb, con_rgb, sign_rgb, rail_rgb, brgb, cab_rgb, rum_rgb]).astype(np.uint16)
     assert len(x) == len(y) == len(z) == len(intensity) == len(rgb), (
         f"length mismatch: x={len(x)} y={len(y)} z={len(z)} i={len(intensity)} rgb={len(rgb)}")
     y = y + 0.5
@@ -406,6 +511,19 @@ def build_simulated_las(
         "class": "safety_barrier",
         "center": [360.0, 5.5, 0.4],
         "dimensions_m": [40.0, 1.4, 0.8],
+    })
+    for (cx0, cy0) in ((140.0, -5.2), (220.0, 5.2)):
+        ground_truth.append({
+            "gt_id": f"GT-CAB-{len(ground_truth) + 1:03d}",
+            "class": "utility_cabinet",
+            "center": [cx0, cy0, 0.67],
+            "dimensions_m": [0.9, 0.7, 1.3],
+        })
+    ground_truth.append({
+        "gt_id": f"GT-RUM-{len(ground_truth) + 1:03d}",
+        "class": "rumble_strip",
+        "center": [217.25, 3.9, 0.02],
+        "dimensions_m": [5.4, 0.6, 0.03],
     })
     ground_truth.append({
         "gt_id": f"GT-PAV-{len(ground_truth) + 1:03d}",

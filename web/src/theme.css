@@ -243,6 +243,116 @@ button {
   font-weight: 500;
 }
 
+/* ---------- four asset classes ---------- */
+.land-classes {
+  max-width: 1020px;
+  margin: 0 auto;
+  padding: 72px 36px 12px;
+  width: 100%;
+}
+
+.section-sub {
+  color: var(--text-dim);
+  font-size: 13.5px;
+  line-height: 1.65;
+  max-width: 640px;
+  margin: 10px auto 0;
+}
+
+.section-sub b {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.cat-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 14px;
+  margin-top: 30px;
+}
+
+.cat-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  background: rgba(16, 22, 29, 0.55);
+  display: flex;
+  flex-direction: column;
+  transition: border-color 0.2s, transform 0.2s;
+}
+
+.cat-card:hover {
+  border-color: var(--accent-dim);
+  transform: translateY(-3px);
+}
+
+.cat-img {
+  position: relative;
+  height: 112px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.cat-img img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: 0.88;
+  display: block;
+}
+
+.cat-chip {
+  position: absolute;
+  left: 10px;
+  bottom: 9px;
+  font-size: 10.5px;
+  letter-spacing: 1.6px;
+  text-transform: uppercase;
+  font-family: var(--mono);
+  font-weight: 700;
+  color: #0b0f14;
+  background: rgba(255, 255, 255, 0.92);
+  padding: 3px 9px;
+  border-radius: 3px;
+}
+
+.cat-items {
+  list-style: none;
+  margin: 0;
+  padding: 13px 14px 6px;
+  flex: 1;
+}
+
+.cat-items li {
+  position: relative;
+  padding-left: 15px;
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.75;
+}
+
+.cat-items li::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 9px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--cat, var(--accent));
+  box-shadow: 0 0 8px var(--cat, var(--accent));
+}
+
+.cat-out {
+  padding: 6px 14px 14px;
+  font-size: 11px;
+  color: var(--text-faint);
+  line-height: 1.6;
+  border-top: 1px solid var(--border-soft);
+  margin-top: 4px;
+  padding-top: 10px;
+}
+
 /* ---------- cards ---------- */
 .land-cards {
   display: grid;
@@ -1329,6 +1439,24 @@ button {
   background: var(--panel);
 }
 
+.cat-row {
+  margin-top: 5px;
+  border-top: 1px solid var(--border-soft);
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 1.2px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+
+.cat-row .check {
+  opacity: 0.85;
+}
+
+.cat-row .count {
+  color: var(--text-dim);
+}
+
 .layer-row .swatch {
   width: 10px;
   height: 10px;
@@ -2049,6 +2177,18 @@ button {
   }
   50% {
     opacity: 1;
+  }
+}
+
+@media (max-width: 980px) {
+  .cat-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 980px) {
+  .cat-grid {
+    grid-template-columns: repeat(2, 1fr);
   }
 }
 

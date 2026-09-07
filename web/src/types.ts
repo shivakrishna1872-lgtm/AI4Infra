@@ -47,6 +47,11 @@ export interface Asset {
   } | null;
   qc_flags: string[];
   flagged: boolean;
+  // ALP assessment layer (observation -> interpretation -> recommended action)
+  condition?: string | null;
+  recommended_action?: string | null;
+  review_required?: boolean;
+  assessment_reasoning?: string | null;
 }
 
 export interface ViewerData {

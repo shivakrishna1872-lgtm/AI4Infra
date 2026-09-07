@@ -124,27 +124,32 @@ def test_quick_simulation_scores_against_ground_truth(tmp_path: Path) -> None:
     assert ground_truth, "simulation must export a ground-truth table"
 
     # Long/area assets (guardrail, barrier, pavement, markings) are extracted per
-    # tile component, so they are matched with class-appropriate radii. Overhead
-    # conductors are excluded: the current heuristic detector does not fire on
-    # this scene's sagged spans (tracked in docs/LIMITATIONS.md).
-    gt_filtered = [g for g in ground_truth if g["class"] != "overhead_conductor"]
+    # tile component, so they are matched with class-appropriate radii. Conductors
+    # are matched at span level (their centroid is mid-span); cabinets at a few
+    # meters; rumble strips along their band group.
     result = evaluate_against_ground_truth(
         assets,
-        gt_filtered,
+        ground_truth,
         match_distance_m={
             "utility_pole": 3.0,
             "traffic_sign": 3.0,
+            "utility_cabinet": 3.0,
+            "overhead_conductor": 12.0,
             "guardrail": 20.0,
             "safety_barrier": 20.0,
+            "rumble_strip": 10.0,
             "pavement": 25.0,
             "pavement_marking": 20.0,
         },
     )
-    assert result["matched_count"] >= 12
+    assert result["matched_count"] >= 15
     assert result["recall"] >= 0.6
     assert result["positional_error_rmse_m"] is not None
     assert result["per_class"]["utility_pole"]["recall"] >= 0.5
     assert result["per_class"]["traffic_sign"]["precision"] >= 0.9
+    assert result["per_class"]["overhead_conductor"]["recall"] >= 0.4
+    assert result["per_class"]["utility_cabinet"]["recall"] >= 0.5
+    assert result["per_class"]["rumble_strip"]["recall"] >= 0.5
 
 
 def test_quick_simulation_output_assets_are_real(tmp_path: Path) -> None:

@@ -57,12 +57,18 @@ def detect_signs(ctx: TileContext) -> List[Asset]:
         # A real panel is thin *relative to* its in-plane size; a half-pole at a
         # tile boundary is an elliptical column whose thickness approaches its
         # in-plane minor side and must not pass as a sign.
+        # A traffic sign is a *vertical* panel: its normal lies near the
+        # horizontal plane. Horizontal slabs (cabinet tops, barrier decks) have
+        # the same planarity and thinness but a vertical normal and must never
+        # pass as signs. normal is the smallest-eigenvalue axis (panel normal).
+        vertical_normal = abs(float(normal[2])) > 0.6
         is_panel = (
             planarity >= settings.sign_min_planarity
             and settings.sign_min_panel_area_m2 <= area <= settings.sign_max_panel_area_m2
             and side_a <= settings.sign_max_panel_side_m
             and thickness <= settings.sign_max_thickness_m
             and thickness <= 0.25 * max(side_b, 1e-3)
+            and not vertical_normal
         )
         if not is_panel:
             continue

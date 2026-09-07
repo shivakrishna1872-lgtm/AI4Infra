@@ -77,3 +77,35 @@ def test_cell_occupancy_counts() -> None:
     counts = cell_occupancy_counts(x, y, 1.0)
     assert counts[(0, 0)] == 2
     assert counts[(1, 1)] == 1
+
+
+def test_voxel_downsample_bounds_and_spreads() -> None:
+    """LOD voxel grid: bounded output, one point per cell, full spatial spread."""
+    from infra_inventory.preprocessing import voxel_downsample
+
+    rng = np.random.default_rng(1)
+    n = 100_000
+    x = rng.uniform(0, 400, n)
+    y = rng.uniform(-12, 12, n)
+    z = rng.uniform(0, 0.8, n)  # surface-dominant corridor, like real mobile LiDAR
+    keep = voxel_downsample(x, y, z, target=5_000)
+    assert 0 < len(keep) <= 5_500  # bounded near the target
+    assert len(keep) < n
+    assert np.unique(keep).size == len(keep)  # no duplicate indices
+    # Coverage is spatial: the kept cloud spans the whole extent.
+    assert np.ptp(x[keep]) > 350
+    assert np.ptp(y[keep]) > 20
+    # Densest area no longer dominates: points per metre are roughly uniform.
+    cell = 10.0
+    bins = np.floor(x[keep] / cell).astype(int)
+    counts = np.bincount(bins)
+    assert counts.max() / max(counts.mean(), 1.0) < 5.0
+
+
+def test_voxel_downsample_empty_and_dense() -> None:
+    from infra_inventory.preprocessing import voxel_downsample
+
+    assert len(voxel_downsample(np.zeros(0), np.zeros(0), np.zeros(0), 100)) == 0
+    x = np.array([0.0, 0.001, 0.002, 0.003])  # four points in one 5 cm cell
+    keep = voxel_downsample(x, np.zeros(4), np.zeros(4), target=10)
+    assert len(keep) == 1  # first point of the cell wins

@@ -21,6 +21,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=7"]
 server = ["fastapi>=0.110", "uvicorn>=0.29", "python-multipart>=0.0.9"]
+s3 = ["boto3>=1.34"]  # optional direct-to-S3 presigned uploads (docs/UPLOADS.md)
+mongo = ["pymongo>=4.6"]  # optional MongoDB mirror of the inventory (MONGO_URI)
 pointcept = ["torch", "torchvision"]  # Pointcept backend; CUDA build required by upstream
 
 [project.scripts]

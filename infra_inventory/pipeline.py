@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import shutil
 import time
 from collections import Counter, defaultdict
@@ -31,18 +32,61 @@ import laspy
 import numpy as np
 
 from .assets import TileContext, assign_ids, detect_all
+from .instances import merge_linear_pieces
+from .assessment import assess_all
 from .confidence import ConfidenceFactors, score_asset, support_score
 from .export import write_outputs
 from .las_reader import gps_run_labels, iter_chunks
 from .models import Asset, ProcessingSettings, RunSummary
+from .mongo_export import export_to_mongo
 from .pointcept import describe_backend, load_class_names, load_predictions, run_pointcept_test
-from .preprocessing import estimate_ground_z, height_above_ground
+from .preprocessing import estimate_ground_z, height_above_ground, voxel_downsample
 from .qc import run_quality_control
 from .roadmarking import run_roadmarking
 from .validation import validate_las
 from .viewer import write_viewer
 
 VERSION = "0.3.0"
+
+#: OpenPCSeg upstream taxonomies (verified against the upstream READMEs;
+#: see configs/model.yaml for the full documentation).
+#: Toronto-3D (WeikaiTan/Toronto-3D): unclassified 0, Road 1, Road marking 2,
+#: Natural 3, Building 4, Utility line 5, Pole 6, Car 7, Fence 8.
+TORONTO3D_CLASS_NAMES = [
+    "unclassified", "road", "road_marking", "natural", "building",
+    "utility_line", "pole", "car", "fence",
+]
+#: SemanticKITTI (OpenPCSeg model zoo; IGNORE_LABEL = 0).
+SEMKITTI_CLASS_NAMES = [
+    "car_c", "bicycle", "motorcycle", "truck", "other-vehicle", "person",
+    "bicyclist", "motorcyclist", "road", "parking", "sidewalk",
+    "other-ground", "building", "fence", "vegetation", "trunk", "terrain",
+    "pole", "traffic-sign", "other-object",
+]
+OPENPCSEG_TAXONOMIES = {
+    "toronto3d": TORONTO3D_CLASS_NAMES,
+    "semantickitti": SEMKITTI_CLASS_NAMES,
+}
+
+#: Documented adaptation from upstream OpenPCSeg classes to infrastructure
+#: evidence (mirrors configs/model.yaml openpcseg.class_mapping; shared by
+#: both taxonomies — the superset of names resolves for either checkpoint).
+DEFAULT_OPENPCSEG_CLASS_MAPPING: Dict[str, Dict[str, object]] = {
+    "road": {"asset_class": "pavement", "subclass": "travelled_surface", "weight": 0.90},
+    "road_marking": {"asset_class": "pavement_marking", "weight": 0.85},
+    "utility_line": {"asset_class": "overhead_conductor", "weight": 0.85},
+    "pole": {"asset_class": "utility_pole", "weight": 0.85},
+    "fence": {"asset_class": "safety_barrier", "weight": 0.55, "evidence_for": ["guardrail"]},
+    "building": {"asset_class": "utility_cabinet", "weight": 0.10},
+    "traffic-sign": {"asset_class": "traffic_sign", "weight": 0.85},
+    "trunk": {"asset_class": None, "weight": 0.2, "evidence_for": ["utility_pole"]},
+    "terrain": {"asset_class": None, "weight": 0.1},
+    "parking": {"asset_class": None, "weight": 0.05},
+    "sidewalk": {"asset_class": None, "weight": 0.05},
+    "natural": {"asset_class": None, "weight": 0.0},
+    "car": {"asset_class": None, "weight": 0.0},
+    "vegetation": {"asset_class": None, "weight": 0.0},
+}
 
 #: Documented adaptation from upstream Pointcept classes to infrastructure
 #: evidence (mirrors configs/model.yaml; used when the YAML is not loaded).
@@ -59,7 +103,7 @@ DEFAULT_CLASS_MAPPING: Dict[str, Dict[str, object]] = {
 _STOPS = ((0.06, 0.16, 0.38), (0.10, 0.45, 0.55), (0.95, 0.80, 0.42))
 
 #: Stage names reported through the progress callback.
-STAGES = ("validating", "streaming", "pointcept", "roadmarking", "detecting", "exporting", "done")
+STAGES = ("validating", "streaming", "pointcept", "openpcseg", "roadmarking", "detecting", "exporting", "done")
 
 
 def _elevation_color(z01: np.ndarray) -> List[List[float]]:
@@ -150,12 +194,23 @@ def _stream_tiles(
         viewer["point_rgb"] = []
     if metadata.has_intensity:
         viewer["point_intensity"] = []
+    # LOD background cloud: pool a bounded candidate set during streaming, then
+    # voxel-downsample to the viewer budget. A strided sample alone ships the
+    # densest areas over-represented and can still be tens of MB; the voxel grid
+    # guarantees one point per cell of space at bounded size (docs/GEMINI.md,
+    # "viewer payload"). The hard byte cap is enforced in export.write_outputs.
+    pool_limit = min(settings.viewer_point_limit * 4, 500_000)
+    pool_x: List[float] = []
+    pool_y: List[float] = []
+    pool_z: List[float] = []
+    pool_rgb: List[List[float]] = []
+    pool_intensity: List[float] = []
+    pool_stride = max(1, math.ceil(metadata.point_count / pool_limit))
     tile_names: List[str] = []
     scanner_ids: List[int] = []
     saw_run2 = False
     z0, _, _, z1, _, _ = metadata.bounds
 
-    sample_stride = max(1, math.ceil(metadata.point_count / settings.viewer_point_limit))
     input_stride = 1
     if settings.max_input_points and metadata.point_count > settings.max_input_points:
         input_stride = max(2, math.ceil(metadata.point_count / settings.max_input_points))
@@ -182,18 +237,17 @@ def _stream_tiles(
                 _progress(f"Streaming chunk {chunk_number + 1}", processed, metadata.point_count)
             if progress_callback:
                 progress_callback({"stage": "streaming", "points_processed": processed, "point_count": metadata.point_count})
-            mask = np.arange(len(x)) % sample_stride == 0
-            z_sample = z[mask]
-            if len(z_sample):
-                z01 = (z_sample - z0) / max((z1 - z0), 1e-6)
-                viewer["points"].extend(np.column_stack((x[mask], y[mask], z_sample)).round(4).tolist())
-                viewer["point_colors"].extend(_elevation_color(z01))
-                if viewer["point_rgb"] is not None and chunk.rgb is not None:
-                    viewer["point_rgb"].extend(np.clip(chunk.rgb[mask] / 65535.0, 0.0, 1.0).round(4).tolist())
-                if viewer["point_intensity"] is not None:
+            mask = np.arange(len(x)) % pool_stride == 0
+            if mask.any():
+                pool_x.extend(x[mask].tolist())
+                pool_y.extend(y[mask].tolist())
+                pool_z.extend(z[mask].tolist())
+                if metadata.has_rgb and chunk.rgb is not None:
+                    pool_rgb.extend(np.clip(chunk.rgb[mask] / 65535.0, 0.0, 1.0).round(4).tolist())
+                if metadata.has_intensity:
                     values = chunk.intensity[mask]
                     if values.max() > 0:
-                        viewer["point_intensity"].extend(np.clip(values / float(values.max()), 0.0, 1.0).round(4).tolist())
+                        pool_intensity.extend(np.clip(values / float(values.max()), 0.0, 1.0).round(4).tolist())
             if chunk.point_source_id is not None:
                 scanner_ids.extend(int(value) for value in np.unique(chunk.point_source_id) if int(value) > 0)
             labels = gps_run_labels(chunk.gps_time)
@@ -209,9 +263,22 @@ def _stream_tiles(
                 _append_tile(tiles_dir, tile_name, source_header, chunk, tile_mask)
         if progress:
             print()
-    if viewer["point_rgb"] is not None and not viewer["point_rgb"]:
+    # Voxel LOD pass: one point per occupied cell, ~viewer_point_limit cells.
+    if pool_x:
+        px = np.asarray(pool_x, dtype=np.float64)
+        py = np.asarray(pool_y, dtype=np.float64)
+        pz = np.asarray(pool_z, dtype=np.float64)
+        keep = voxel_downsample(px, py, pz, settings.viewer_point_limit)
+        viewer["points"] = np.column_stack((px[keep], py[keep], pz[keep])).round(4).tolist()
+        z01 = (pz[keep] - z0) / max((z1 - z0), 1e-6)
+        viewer["point_colors"] = _elevation_color(z01)
+        if metadata.has_rgb and pool_rgb:
+            viewer["point_rgb"] = [pool_rgb[i] for i in keep.tolist()]
+        if metadata.has_intensity and pool_intensity:
+            viewer["point_intensity"] = [pool_intensity[i] for i in keep.tolist()]
+    if not viewer["point_rgb"]:
         viewer["point_rgb"] = None
-    if viewer["point_intensity"] is not None and not viewer["point_intensity"]:
+    if not viewer["point_intensity"]:
         viewer["point_intensity"] = None
     summary = RunSummary(
         input_path=str(input_path), point_count=metadata.point_count, bounds=metadata.bounds,
@@ -386,6 +453,9 @@ def process_las(
     confidence_weights: Optional[Dict[str, Dict[str, float]]] = None,
     progress: bool = True,
     progress_callback: Optional[Callable[[dict], None]] = None,
+    mongo_uri: Optional[str] = None,
+    mongo_database: str = "ai4infra",
+    mongo_collection: str = "assets",
 ) -> RunSummary:
     """Run the full pipeline: LAS -> tiling -> detection -> inventory -> exports.
 
@@ -441,6 +511,43 @@ def process_las(
             "Pointcept predictions imported through the documented adaptation layer "
             "(configs/model.yaml); geometry detectors still gate every asset."
         )
+    elif settings.backend == "openpcseg":
+        from .openpcseg import describe_openpcseg, load_indexed_predictions, run_openpcseg_infer
+
+        if not all((settings.openpcseg_root, settings.openpcseg_config, settings.openpcseg_weight)):
+            raise ValueError(
+                "OpenPCSeg backend requires --openpcseg-root, --openpcseg-config, and "
+                "--openpcseg-weight. No class mapping is assumed without them."
+            )
+        if settings.openpcseg_taxonomy not in OPENPCSEG_TAXONOMIES:
+            raise ValueError(
+                f"Unknown openpcseg taxonomy '{settings.openpcseg_taxonomy}'. "
+                f"Available: {', '.join(sorted(OPENPCSEG_TAXONOMIES))}"
+            )
+        report("openpcseg", message="Running OpenPCSeg inference on tensor tiles")
+        from .tensor_export import export_tiles_to_tensors
+
+        tensor_manifest = export_tiles_to_tensors(output / "tiles", output / "tensors", tile_names)
+        backend = describe_openpcseg(settings.openpcseg_root)
+        backend = run_openpcseg_infer(
+            root=settings.openpcseg_root, cfg_file=settings.openpcseg_config,
+            checkpoint=settings.openpcseg_weight, num_gpus=settings.openpcseg_num_gpus,
+            prediction_dir=output / "predictions",
+            extra_options={"DATA.DATA_PATH": str((output / "tensors").resolve())},
+        )
+        backend["name"] = "openpcseg"
+        backend["taxonomy"] = settings.openpcseg_taxonomy
+        backend["tensor_manifest"] = tensor_manifest
+        class_names = list(OPENPCSEG_TAXONOMIES[settings.openpcseg_taxonomy])
+        predictions = load_indexed_predictions(output / "predictions", tile_names)
+        # A caller-supplied mapping wins; the documented default applies otherwise.
+        class_mapping = class_mapping or dict(DEFAULT_OPENPCSEG_CLASS_MAPPING)
+        matched = sum(1 for tile in tile_names if len(predictions.get(tile, [])) > 0)
+        summary.warnings.append(
+            f"OpenPCSeg predictions imported for {matched}/{len(tile_names)} tiles through "
+            "the documented adaptation layer (configs/model.yaml); geometry detectors "
+            "still gate every asset."
+        )
     summary.backend = backend
 
     # ---- Optional specialized subsystem: RoadMarkingExtraction -------------------
@@ -474,23 +581,97 @@ def process_las(
             predictions, class_names, class_mapping, sample_stride, progress,
         ))
     all_assets.extend(roadmarking_assets)
+    # Thin linear assets (overhead conductors) are cut by tile boundaries; join
+    # the collinear pieces back into spans before QC/assessment so each span is
+    # one asset (merges across shared poles are explicitly refused).
+    all_assets = merge_linear_pieces(all_assets)
 
-    # ---- Quality control + export -------------------------------------------------
-    report("exporting", assets=len(all_assets), message="Quality control and export")
+    # ---- Optional learned backend: Gemini class-validation booster ----------------------
+    # Geometry decided every asset; Gemini independently validates the assigned
+    # class from the measured evidence and folds the verdict into the ``model``
+    # confidence factor. Any failure (no key, network, parse) degrades to the
+    # geometry-only confidence and records a warning - never a broken run, and
+    # never a half-boosted inventory (docs/GEMINI.md).
+    gemini_summary: Optional[dict] = None
+    if settings.backend == "gemini":
+        try:
+            from .gemini import GeminiBooster
+
+            report("detecting", message="Gemini class-validation pass")
+            booster = GeminiBooster(
+                model=settings.gemini_model,
+                api_key=settings.gemini_api_key,
+                cache_path=str(output / "gemini_cache.json"),
+            )
+            gemini_summary = booster.boost(all_assets)
+            summary.backend = {
+                "name": "gemini",
+                "available": True,
+                "gpu_required": False,
+                "reason": f"Gemini class-validation booster ({settings.gemini_model}); "
+                           "geometry detectors remain the asset gate.",
+            }
+            summary.warnings.append(
+                f"Gemini validated {gemini_summary['applied']}/{gemini_summary['eligible']} "
+                f"assets (model {settings.gemini_model}, {gemini_summary['api_calls']} API calls, "
+                f"{gemini_summary['cache_hits']} cache hits, "
+                f"{gemini_summary['disagreements']} disagreements routed to review)."
+            )
+        except Exception as exc:  # the booster is optional; never fail the run for it
+            summary.warnings.append(f"Gemini validation skipped: {exc}")
+            settings.backend = "geometry"
+
+    # ---- Quality control + ALP assessment + export -----------------------------------
+    report("exporting", assets=len(all_assets), message="Quality control, assessment and export")
     all_assets, qc_report = run_quality_control(all_assets, settings)
+    assess_all(all_assets, settings.review_confidence_threshold)
     summary.assets = all_assets
     summary.elapsed_seconds = time.monotonic() - started
+
+    # ---- Optional MongoDB mirror -------------------------------------------------------
+    # Off by default; enabled by MONGO_URI (server/CLI env) or --mongo-uri.
+    # The mirror must never break the pipeline: any failure is a warning, and
+    # the canonical JSON/CSV/GeoJSON exports are unaffected.
+    mongo_uri = mongo_uri or os.environ.get("MONGO_URI")
+    if mongo_uri:
+        try:
+            mongo_result = export_to_mongo(
+                [asset.to_dict() for asset in all_assets],
+                {"input_path": str(path), "point_count": summary.point_count,
+                 "crs": summary.crs, "processing_version": VERSION},
+                mongo_uri, database=mongo_database, collection=mongo_collection,
+            )
+            summary.warnings.append(
+                f"MongoDB mirror updated: {mongo_result['inserted']} assets -> "
+                f"{mongo_result['database']}.{mongo_result['collection']}."
+            )
+        except Exception as exc:  # mirror is optional; never fail the run for it
+            summary.warnings.append(f"MongoDB export skipped: {exc}")
 
     asset_classes = sorted({asset.asset_class for asset in all_assets})
     viewer["point_class"] = _compute_point_classes(viewer["points"], all_assets, asset_classes)
     viewer["point_class_names"] = asset_classes
+    # Web/API runs do not need to keep multi-GB per-tile LAS files after
+    # processing (the viewer + exports carry everything the app serves); the CLI
+    # keeps them for Pointcept/roadmarking work and full point provenance. The
+    # warning is recorded before export so it lands in run.json / inventory.json.
+    if not settings.save_tiles:
+        summary.warnings.append(
+            "Per-tile LAS files were removed after processing (save_tiles=false); "
+            "source_tile names and point indices are preserved in every asset, and "
+            "representative evidence points ship in the per-asset exports."
+        )
     write_outputs(output, summary, qc_report, viewer)
-    write_viewer(output / "viewer")
-    shutil.copy2(output / "viewer-data.json", output / "viewer" / "viewer-data.json")
-    (output / "tiles" / "manifest.json").write_text(
+    tiles_dir = output / "tiles"
+    tiles_dir.mkdir(parents=True, exist_ok=True)
+    (tiles_dir / "manifest.json").write_text(
         json.dumps({"tiles": tile_names, "count": len(tile_names), "order": "streaming append order"}, indent=2),
         encoding="utf-8",
     )
+    write_viewer(output / "viewer")
+    shutil.copy2(output / "viewer-data.json", output / "viewer" / "viewer-data.json")
+    if not settings.save_tiles:
+        shutil.rmtree(tiles_dir, ignore_errors=True)
     if progress:
         print(
             f"[done] {len(all_assets)} assets in {summary.elapsed_seconds:.1f}s -> {output}",

@@ -42,6 +42,7 @@ export default function Viewer({ project, onBack }: Props) {
   const [presetSig, setPresetSig] = useState(0);
   const [dragging, setDragging] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);
+  const [loadKey, setLoadKey] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -59,7 +60,7 @@ export default function Viewer({ project, onBack }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [project.id]);
+  }, [project.id, loadKey]);
 
   const hasRgb = !!(data && data.point_rgb && data.point_rgb.length > 0);
   const hasClass = !!(data && data.point_class && data.point_class.length > 0);
@@ -184,8 +185,11 @@ export default function Viewer({ project, onBack }: Props) {
     return (
       <div className="err-screen">
         <div>NO DATA PROCESSED</div>
-        <div style={{ fontSize: 11, color: "var(--text-faint)" }}>{loadError}</div>
-        <button className="btn" onClick={onBack}>← Back to projects</button>
+        <div style={{ fontSize: 11, color: "var(--text-faint)", maxWidth: 520, textAlign: "center" }}>{loadError}</div>
+        <div style={{ display: "flex", gap: 10 }}>
+          <button className="btn" onClick={() => setLoadKey((k) => k + 1)}>↻ Retry load</button>
+          <button className="btn ghost" onClick={onBack}>← Back to projects</button>
+        </div>
       </div>
     );
   }

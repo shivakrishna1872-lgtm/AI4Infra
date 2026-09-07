@@ -6,6 +6,43 @@ interface Props {
   onOpen: (project: Project, jobId: string | null) => void;
 }
 
+// The four required competition classes - each card lists exactly what the
+// pipeline extracts for that category, with the class color used in the viewer.
+const CATEGORY_CARDS = [
+  {
+    title: "Pavement",
+    color: "#4d7cff",
+    image:
+      "https://images.unsplash.com/photo-1500530855697-b586d89ba3ee?auto=format&fit=crop&w=640&q=70",
+    items: ["Travelled surface", "Painted pavement markings", "Lane lines · stop lines · crosswalks"],
+    output: "Surface patches and individual markings, each with area, width, orientation and retro-reflectivity signal.",
+  },
+  {
+    title: "Utilities",
+    color: "#b082f7",
+    image:
+      "https://images.unsplash.com/photo-1517022812141-23620dba5c23?auto=format&fit=crop&w=640&q=70",
+    items: ["Utility poles", "Overhead conductors", "Cabinets · junction boxes"],
+    output: "Every pole, conductor span and cabinet as its own asset with height, lean, scanner and run attribution.",
+  },
+  {
+    title: "Signs",
+    color: "#ff7e9d",
+    image:
+      "https://images.unsplash.com/photo-1544441893-675973e31985?auto=format&fit=crop&w=640&q=70",
+    items: ["Sign panels", "Structures carrying signs", "Regulatory & warning signs"],
+    output: "Panels and their support structures with panel area, orientation and confidence — not just segmented points.",
+  },
+  {
+    title: "Safety",
+    color: "#62e8b9",
+    image:
+      "https://images.unsplash.com/photo-1477959858617-67f85cf4f1df?auto=format&fit=crop&w=640&q=70",
+    items: ["Guardrails", "Barriers", "Rumble strips"],
+    output: "Linear safety assets with measured length, continuity and ALP condition flags.",
+  },
+];
+
 const FLOW_STEPS = [
   { label: "LAS / LAZ", sub: "Raw point cloud" },
   { label: "VALIDATE", sub: "LAS 1.4 · format · CRS" },
@@ -107,7 +144,10 @@ export default function Landing({ onOpen }: Props) {
       (async () => {
         try {
           const created = await api.createProject(name);
-          await api.uploadLas(created.id, file);
+          await api.uploadLas(created.id, file, (p) => {
+            const pct = p.totalBytes ? Math.round((p.uploadedBytes / p.totalBytes) * 100) : 0;
+            setBusy(`Uploading ${file.name}… ${pct}% (part ${p.part}/${p.parts})`);
+          });
           setBusy("Starting pipeline…");
           const { job_id } = await api.process(created.id);
           onOpen(created, job_id);
@@ -336,6 +376,46 @@ export default function Landing({ onOpen }: Props) {
           </div>
         </Reveal>
       </div>
+
+      {/* ---------- four asset classes ---------- */}
+      <section className="land-classes">
+        <Reveal>
+          <div className="land-data-h">
+            <h2 className="section-eyebrow">THE OBJECTIVE</h2>
+            <h3>Four asset classes, extracted as individual inventory objects</h3>
+            <p className="section-sub">
+              Not a segmented point cloud — each category is detected as{" "}
+              <b>individual assets</b> with a location, geometry, attributes and
+              confidence. Toggle any category in the 3D viewer.
+            </p>
+          </div>
+        </Reveal>
+        <div className="cat-grid">
+          {CATEGORY_CARDS.map((cat, i) => (
+            <Reveal key={cat.title} threshold={0.2} delay={i * 70}>
+              <div className="cat-card" style={{ "--cat": cat.color } as React.CSSProperties}>
+                <div className="cat-img" style={{ background: cat.color }}>
+                  <img
+                    src={cat.image}
+                    alt={`${cat.title} — extracted by the LiDAR pipeline`}
+                    loading="lazy"
+                    onError={(e) => {
+                      e.currentTarget.style.display = "none";
+                    }}
+                  />
+                  <span className="cat-chip">{cat.title}</span>
+                </div>
+                <ul className="cat-items">
+                  {cat.items.map((item) => (
+                    <li key={item}>{item}</li>
+                  ))}
+                </ul>
+                <div className="cat-out">{cat.output}</div>
+              </div>
+            </Reveal>
+          ))}
+        </div>
+      </section>
 
       {/* ---------- data section ---------- */}
       <section className="land-data">

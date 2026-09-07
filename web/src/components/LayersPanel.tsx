@@ -90,12 +90,27 @@ export default function LayersPanel({
               <span className="count">{assets.length}</span>
             </div>
 
-            {CATEGORIES.filter((cat) => cat.classes.some((c) => present.has(c))).map((cat) => (
-              <div key={cat.label}>
-                <div className="twin-group" style={{ paddingLeft: 14 }}>{cat.label}</div>
-                {cat.classes
-                  .filter((cls) => present.has(cls))
-                  .map((cls) => (
+            {CATEGORIES.filter((cat) => cat.classes.some((c) => present.has(c))).map((cat) => {
+              const presentClasses = cat.classes.filter((c) => present.has(c));
+              const catOn = presentClasses.every((c) => visibleClasses.has(c));
+              const catCount = presentClasses.reduce((sum, c) => sum + (counts.get(c) ?? 0), 0);
+              return (
+                <div key={cat.label}>
+                  <div
+                    className="layer-row cat-row"
+                    onClick={() => {
+                      for (const cls of presentClasses) {
+                        if (catOn ? visibleClasses.has(cls) : !visibleClasses.has(cls)) {
+                          onToggleClass(cls);
+                        }
+                      }
+                    }}
+                  >
+                    <span className="check">{catOn ? "☑" : "☐"}</span>
+                    <span className="lname">{cat.label}</span>
+                    <span className="count">{catCount}</span>
+                  </div>
+                  {presentClasses.map((cls) => (
                     <div key={cls} className={`layer-row ${visibleClasses.has(cls) ? "" : "off"}`} onClick={() => onToggleClass(cls)}>
                       <span className="check">{visibleClasses.has(cls) ? "☑" : "☐"}</span>
                       <span className="swatch" style={{ background: CLASS_COLORS[cls] ?? "#8899aa" }} />
@@ -103,8 +118,9 @@ export default function LayersPanel({
                       <span className="count">{counts.get(cls) ?? 0}</span>
                     </div>
                   ))}
-              </div>
-            ))}
+                </div>
+              );
+            })}
           </>
         ) : (
           <>

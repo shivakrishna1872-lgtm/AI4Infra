@@ -8,7 +8,7 @@ Commands:
     tile input.las --output out/tiles   tiling stage only
     backends                            report available inference backends (GPU/CUDA detection)
     download-models                     fetch documented pretrained weights
-    train ...                           optional Pointcept fine-tuning bridge
+    train ...                           optional Pointcept/OpenPCSeg fine-tuning bridge
     demo-data out/                      generate a synthetic test LAS
 
 Exit codes: 0 success, 1 user error, 2 pipeline failure.
@@ -59,9 +59,11 @@ def _merge_settings(args: argparse.Namespace) -> ProcessingSettings:
     settings = ProcessingSettings.from_dict(values)
     # CLI flags override YAML
     for name in ("chunk_size", "tile_size", "viewer_points", "strict_las14", "backend",
-                 "pointcept_root", "pointcept_config", "pointcept_weight", "pointcept_class_names",
-                 "pointcept_num_gpus", "roadmarking_command", "roadmarking_config",
-                 "max_input_points"):
+                 "gemini_model", "pointcept_root", "pointcept_config", "pointcept_weight",
+                 "pointcept_class_names", "pointcept_num_gpus", "openpcseg_root",
+                 "openpcseg_config", "openpcseg_weight", "openpcseg_taxonomy",
+                 "openpcseg_num_gpus", "roadmarking_command",
+                 "roadmarking_config", "max_input_points"):
         if name in ("tile_size", "viewer_points"):
             field = "tile_size_m" if name == "tile_size" else "viewer_point_limit"
             value = getattr(args, name, None)
@@ -75,7 +77,12 @@ def _merge_settings(args: argparse.Namespace) -> ProcessingSettings:
 def _process(args: argparse.Namespace) -> int:
     settings = _merge_settings(args)
     try:
-        result = process_las(args.input, args.output, settings)
+        result = process_las(
+            args.input, args.output, settings,
+            mongo_uri=args.mongo_uri or os.environ.get("MONGO_URI"),
+            mongo_database=args.mongo_db or "ai4infra",
+            mongo_collection=args.mongo_collection or "assets",
+        )
     except InfraError as exc:
         print(exc.user_message(), file=sys.stderr)
         return EXIT_PIPELINE
@@ -180,7 +187,30 @@ def _tile(args: argparse.Namespace) -> int:
 
 
 def _backends(args: argparse.Namespace) -> int:
-    print(json.dumps(describe_backend(args.pointcept_root, args.pointcept_class_names), indent=2))
+    from .openpcseg import describe_openpcseg
+
+    def _configured(detail: dict, root: str | None) -> dict:
+        # Without a checkout configured the learned backends simply fall back
+        # to geometry; report that honestly instead of "available".
+        if not root:
+            return {
+                "name": detail["name"],
+                "available": False,
+                "gpu_required": detail["gpu_required"],
+                "reason": "Not configured (no checkout root given); the geometry "
+                          "backend handles the run.",
+            }
+        return detail
+
+    report = {
+        "geometry": describe_backend(None, None),
+        "pointcept": _configured(
+            describe_backend(args.pointcept_root, args.pointcept_class_names),
+            args.pointcept_root,
+        ),
+        "openpcseg": _configured(describe_openpcseg(args.openpcseg_root), args.openpcseg_root),
+    }
+    print(json.dumps(report, indent=2))
     return EXIT_OK
 
 
@@ -196,19 +226,47 @@ def _download_models(args: argparse.Namespace) -> int:
 
 
 def _train(args: argparse.Namespace) -> int:
-    """Optional Pointcept fine-tuning bridge: run upstream tools/train.py."""
+    """Optional upstream fine-tuning bridge: Pointcept tools/train.py or OpenPCSeg train.py."""
     from .errors import BackendConfigurationError
+
+    import os
+    import subprocess
+
+    if args.framework == "openpcseg":
+        from .openpcseg import run_openpcseg_train
+
+        root = args.openpcseg_root
+        if not root:
+            raise BackendConfigurationError(
+                "OpenPCSeg fine-tuning requires --openpcseg-root.",
+                "Clone https://github.com/BAI-Yeqi/OpenPCSeg, install its environment, "
+                "then pass --openpcseg-root. See docs/LEARNED_MODELS.md.",
+            )
+        if not args.openpcseg_config:
+            raise BackendConfigurationError(
+                "OpenPCSeg fine-tuning requires --openpcseg-config.",
+                "Point at an OpenPCSeg training config (tools/cfgs/...). "
+                "Prepare Toronto-3D first: scripts/prepare_toronto3d.py.",
+            )
+        try:
+            run_openpcseg_train(
+                root=root, cfg_file=args.openpcseg_config, init_checkpoint=args.init_weight,
+                num_gpus=args.num_gpus, extra_tag=args.extra_tag,
+            )
+        except Exception as exc:
+            message = getattr(exc, "user_message", None)
+            print(message() if message else str(exc), file=sys.stderr)
+            return EXIT_PIPELINE
+        return EXIT_OK
 
     root = Path(args.pointcept_root).expanduser().resolve() if args.pointcept_root else None
     script = root / "tools" / "train.py" if root else None
     if root is None or script is None or not script.is_file():
         raise BackendConfigurationError(
-            "Fine-tuning requires a Pointcept checkout with tools/train.py.",
+            "Pointcept fine-tuning requires a Pointcept checkout with tools/train.py.",
             "Clone https://github.com/Pointcept/Pointcept, install its environment, "
             "then pass --pointcept-root. See docs/ENHANCEMENT.md.",
         )
-    import os
-    import subprocess
 
     command = [sys.executable, str(script), "--config-file", str(Path(args.pointcept_config).expanduser().resolve())]
     environment = os.environ.copy()
@@ -277,14 +335,26 @@ def build_parser() -> argparse.ArgumentParser:
     process.add_argument("--max-input-points", dest="max_input_points", type=int, default=0,
                         help="Uniformly thin inputs larger than this many points (0 = process all)")
     process.add_argument("--strict-las14", action="store_true", help="Fail on non-LAS-1.4 input")
-    process.add_argument("--backend", choices=("geometry", "pointcept"), help="Inference backend")
+    process.add_argument("--backend", choices=("geometry", "pointcept", "openpcseg", "gemini"),
+                         help="Inference backend (gemini needs GEMINI_API_KEY; see docs/GEMINI.md; "
+                              "openpcseg needs a checkout + checkpoint; see docs/LEARNED_MODELS.md)")
+    process.add_argument("--gemini-model", default="gemini-3.6-flash", help="Gemini model for the class-validation booster")
     process.add_argument("--pointcept-root", help="Path to the Pointcept checkout")
     process.add_argument("--pointcept-config", help="Adapted Pointcept config consuming output/tiles/")
     process.add_argument("--pointcept-weight", help="PTv3 checkpoint (.pth)")
     process.add_argument("--pointcept-class-names", help="JSON list of the config's class taxonomy")
     process.add_argument("--pointcept-num-gpus", type=int, help="GPUs for Pointcept inference")
+    process.add_argument("--openpcseg-root", help="Path to the OpenPCSeg checkout")
+    process.add_argument("--openpcseg-config", help="OpenPCSeg config (.yaml, tools/cfgs/...)")
+    process.add_argument("--openpcseg-weight", help="OpenPCSeg checkpoint (.pth)")
+    process.add_argument("--openpcseg-taxonomy", choices=("toronto3d", "semantickitti"),
+                         help="Which upstream taxonomy the checkpoint predicts (default toronto3d)")
+    process.add_argument("--openpcseg-num-gpus", type=int, help="GPUs for OpenPCSeg inference")
     process.add_argument("--roadmarking-command", help="RoadMarkingExtraction run script (opt-in)")
     process.add_argument("--roadmarking-config", help="RoadMarkingExtraction parameter config")
+    process.add_argument("--mongo-uri", help="MongoDB connection string; mirrors the inventory (or MONGO_URI env)")
+    process.add_argument("--mongo-db", default="ai4infra", help="MongoDB database (default: ai4infra)")
+    process.add_argument("--mongo-collection", default="assets", help="MongoDB collection (default: assets)")
     process.set_defaults(func=_process)
 
     serve = subparsers.add_parser("serve", help="Serve an output viewer locally")
@@ -311,16 +381,25 @@ def build_parser() -> argparse.ArgumentParser:
     backends = subparsers.add_parser("backends", help="Report available inference backends")
     backends.add_argument("--pointcept-root")
     backends.add_argument("--pointcept-class-names")
+    backends.add_argument("--openpcseg-root")
     backends.set_defaults(func=_backends)
 
     models = subparsers.add_parser("download-models", help="Download documented pretrained model weights")
     models.add_argument("--output", default="models", help="Output directory (default: ./models)")
-    models.add_argument("--model", default="nuscenes-ptv3-semseg", help="Model key (see scripts/download_models.py)")
+    models.add_argument("--model", default="nuscenes-ptv3-semseg",
+                        help="Model key: nuscenes-ptv3-semseg | semkitti-minkunet | semkitti-spvcnn | semkitti-cylinder3d")
     models.set_defaults(func=_download_models)
 
-    train = subparsers.add_parser("train", help="Optional Pointcept fine-tuning bridge (requires Pointcept env)")
-    train.add_argument("--pointcept-root", required=True, help="Path to the Pointcept checkout")
-    train.add_argument("--pointcept-config", required=True, help="Pointcept training config")
+    train = subparsers.add_parser("train", help="Optional fine-tuning bridge (requires upstream env)")
+    train.add_argument("--framework", choices=("pointcept", "openpcseg"), default="pointcept",
+                       help="Which upstream training entrypoint to run")
+    train.add_argument("--pointcept-root", help="Path to the Pointcept checkout (framework=pointcept)")
+    train.add_argument("--pointcept-config", help="Pointcept training config")
+    train.add_argument("--openpcseg-root", help="Path to the OpenPCSeg checkout (framework=openpcseg)")
+    train.add_argument("--openpcseg-config", help="OpenPCSeg training config (tools/cfgs/...)")
+    train.add_argument("--init-weight", help="Optional init checkpoint (.pth) for fine-tuning")
+    train.add_argument("--num-gpus", type=int, default=1, help="GPUs for training")
+    train.add_argument("--extra-tag", default="finetune", help="OpenPCSeg experiment tag")
     train.set_defaults(func=_train)
 
     demo = subparsers.add_parser("demo-data", help="Generate a synthetic test LAS (testing only)")

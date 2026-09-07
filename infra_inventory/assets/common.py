@@ -132,9 +132,17 @@ def build_asset(
     explanation: str,
     method: str,
     model_target_classes: tuple[str, ...] = (),
+    min_points: Optional[int] = None,
 ) -> Optional[Asset]:
-    """Turn a detected component into a fully attributed Asset."""
-    if len(indices) < ctx.settings.min_asset_points:
+    """Turn a detected component into a fully attributed Asset.
+
+    ``min_points`` defaults to the global ``min_asset_points`` floor; detectors
+    with a class-specific support gate (e.g. ``conductor_min_points=15`` vs the
+    global 25) pass their own minimum so a fragment that passed every detector
+    rule is not silently dropped here. Dropping 15-24-point wire fragments
+    stripped the ends of spans and biased their reported centroids.
+    """
+    if len(indices) < (min_points if min_points is not None else ctx.settings.min_asset_points):
         return None
     assert asset_class in VALID_TAXONOMY, f"Unknown asset class {asset_class}"
     if subclass is not None and subclass not in VALID_TAXONOMY[asset_class]:

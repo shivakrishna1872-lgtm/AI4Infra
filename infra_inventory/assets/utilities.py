@@ -13,7 +13,7 @@ from typing import List
 
 import numpy as np
 
-from ..instances import component_metrics, grid_components
+from ..instances import component_cross_section_m, component_metrics, grid_components
 from ..models import Asset
 from .common import TileContext, build_asset
 
@@ -25,24 +25,57 @@ def detect_utilities(ctx: TileContext) -> List[Asset]:
 
     # ---- Poles ----------------------------------------------------------------
     # Exclude the ground surface itself (height < 0.3) so the pole stands as its
-    # own component; pole points above 0.3 m still dominate the component.
+    # own component. Components routinely absorb neighbours at grid resolution
+    # (a guardrail run, or the two wire spans that share a pole), so pole-ness is
+    # measured from the *densest XY cell* - the shaft - not the whole component:
+    # a merged guardrail inflates a component bbox to tens of metres and a merged
+    # crossarm/wire pair collapses columnarity, even though the shaft is clean.
     pole_mask = ctx.height >= max(0.3, settings.pole_min_height_m * 0.12)
     for component in grid_components(ctx.x, ctx.y, pole_mask, settings.pole_resolution_m, min_cells=1):
         if len(component) < settings.pole_min_points:
             continue
-        # Attachments (crossarms, insulator brackets, wires) sit at the pole top;
-        # measure pole-ness from the lower 70% of the trunk so a crossarm never
-        # disqualifies a real pole. Point count / centroid stay full-component.
-        zs = ctx.z[component]
+        # Densest XY cell of the component = the trunk column. Guardrail/panel
+        # neighbours sit metres away and never win the density vote.
+        xs = ctx.x[component]
+        ys = ctx.y[component]
+        res = settings.pole_resolution_m
+        ix = ((xs - xs.min()) / res).astype(np.int64)
+        iy = ((ys - ys.min()) / res).astype(np.int64)
+        x_cells = int(ix.max()) + 1
+        keys = iy * x_cells + ix
+        uniq, counts = np.unique(keys, return_counts=True)
+        best_key = uniq[int(np.argmax(counts))]
+        cell_cx = xs.min() + (best_key % x_cells + 0.5) * res
+        cell_cy = ys.min() + (best_key // x_cells + 0.5) * res
+        # Near-axis points: the trunk plus attachments. The densest cell's centre
+        # sits within half a cell diagonal of the pole axis and the shaft adds its
+        # radius, so ~0.7 m always contains the whole trunk (0.45 m cells, poles
+        # up to ~0.7 m diameter). The radius is also the *rejection* envelope:
+        #  - too wide (1.2 m) leaks a concrete barrier's top edge (~1 m from the
+        #    pole) into the lower-80% shaft, inflating the footprint past
+        #    pole_max_footprint_m and collapsing columnarity (measured miss on
+        #    the barrier-adjacent pole, seed 7 QuickSim);
+        #  - too narrow (0.7 m) lets a sign panel merged with a guardrail rail
+        #    (0.3 m offset) pass as a pole: the shaft footprint lands just under
+        #    the gate (measured false positive, seed 7 QuickSim).
+        # 0.9 m excludes the barrier (>1.0 m away) yet sweeps enough of a
+        # parallel rail to push the sign+rail footprint over the gate.
+        axis_mask = np.hypot(xs - cell_cx, ys - cell_cy) <= 0.9
+        near_axis = component[axis_mask]
+        if len(near_axis) < settings.pole_min_points:
+            continue
+        metrics = component_metrics(ctx.x, ctx.y, ctx.z, near_axis)
+        # Lower 80% of the shaft only (excludes crossarm/wire points at the top)
+        # for the narrow-footprint / columnarity gates.
+        zs = ctx.z[near_axis]
         z_lo, z_hi = float(zs.min()), float(zs.max())
-        trunk = component[zs <= z_lo + 0.7 * max(z_hi - z_lo, 1e-3)]
-        metrics = component_metrics(ctx.x, ctx.y, ctx.z, component)
-        trunk_metrics = component_metrics(ctx.x, ctx.y, ctx.z, trunk)
-        footprint = max(trunk_metrics["length_m"], trunk_metrics["width_m"])
+        shaft = near_axis[zs <= z_lo + 0.8 * max(z_hi - z_lo, 1e-3)]
+        shaft_metrics = component_metrics(ctx.x, ctx.y, ctx.z, shaft)
+        footprint = max(shaft_metrics["length_m"], shaft_metrics["width_m"])
         if (
             metrics["height_m"] >= settings.pole_min_height_m
             and footprint <= settings.pole_max_footprint_m
-            and trunk_metrics["columnarity"] >= settings.pole_min_columnarity
+            and shaft_metrics["columnarity"] >= settings.pole_min_columnarity
         ):
             # Geometry: how pole-like is it? Dominant vertical extent + narrow base.
             vertical_ratio = metrics["height_m"] / max(footprint, 1e-3)
@@ -55,7 +88,7 @@ def detect_utilities(ctx: TileContext) -> List[Asset]:
                 ctx,
                 asset_class="utility_pole",
                 subclass="vertical_support",
-                indices=component,
+                indices=near_axis,
                 geometry_score=geometry_score,
                 explanation=explanation,
                 method="geometry-v1",
@@ -63,26 +96,39 @@ def detect_utilities(ctx: TileContext) -> List[Asset]:
             )
             if asset is not None:
                 assets.append(asset)
-                pole_points[component] = True
+                # Claim only the pole footprint + crossarm reach. Claiming the
+                # whole connected component would swallow the attached conductor
+                # run: at grid resolution the wire merges with the trunk at the
+                # attachment, so a component-wide claim deletes the entire span
+                # in every tile whose wire cells touch the pole.
+                pole_points[component[axis_mask]] = True
 
     # ---- Overhead conductors ---------------------------------------------------
+    # Poles and their crossarms sit in the same x,y cells the wires attach to;
+    # including them merges trunk+crossarm+wire into one component whose vertical
+    # extent (> conductor_max_height_extent_m) rejects the whole span. Exclude
+    # points already claimed by a detected pole so each wire becomes its own
+    # elevated thin chain.
     conductor_mask = ctx.height >= settings.conductor_min_height_m
+    conductor_mask &= ~pole_points
     for component in grid_components(ctx.x, ctx.y, conductor_mask, settings.conductor_resolution_m, min_cells=3):
         if len(component) < settings.conductor_min_points:
             continue
         metrics = component_metrics(ctx.x, ctx.y, ctx.z, component)
+        # Bounding-box width is orientation dependent (a 14-deg wire measures
+        # metres wide), so the thickness gate uses the 2-sigma minor PCA axis.
+        cross_section = component_cross_section_m(ctx.x, ctx.y, ctx.z, component)
         length = max(metrics["length_m"], metrics["width_m"])
-        lateral = min(metrics["length_m"], metrics["width_m"])
         if (
             length >= settings.conductor_min_length_m
-            and lateral <= settings.conductor_max_width_m
+            and cross_section <= settings.conductor_max_width_m
             and metrics["height_m"] <= settings.conductor_max_height_extent_m
             and metrics["linearity"] >= 0.55
         ):
             geometry_score = min(0.7, 0.35 + metrics["linearity"] * 0.25 + min(length / 50.0, 0.2))
             explanation = (
-                f"Elevated thin linear chain ({length:.1f} m long, {lateral:.2f} m across) is "
-                "consistent with an overhead conductor; heuristic detection."
+                f"Elevated thin linear chain ({length:.1f} m long, ~{cross_section:.2f} m "
+                "cross-section) is consistent with an overhead conductor; heuristic detection."
             )
             asset = build_asset(
                 ctx,
@@ -93,6 +139,7 @@ def detect_utilities(ctx: TileContext) -> List[Asset]:
                 explanation=explanation,
                 method="geometry-v2-heuristic",
                 model_target_classes=(),
+                min_points=settings.conductor_min_points,
             )
             if asset is not None:
                 assets.append(asset)

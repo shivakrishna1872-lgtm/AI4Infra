@@ -1,7 +1,25 @@
 import type { JobStatus, Project, ViewerData } from "./types";
 
-async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init);
+async function request<T>(
+  url: string,
+  init?: RequestInit,
+  timeoutMs = 60000
+): Promise<T> {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  let response: Response;
+  try {
+    response = await fetch(url, { ...init, signal: controller.signal });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new Error(
+        `Request timed out after ${Math.round(timeoutMs / 1000)}s — the connection stalled. Try again.`
+      );
+    }
+    throw err;
+  } finally {
+    window.clearTimeout(timer);
+  }
   if (!response.ok) {
     let detail = response.statusText;
     let rawBody = "";
@@ -33,6 +51,175 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
+// ---------------------------------------------------------------------------
+// Resumable chunked uploads for multi-GB LAS/LAZ files.
+//
+// A 3.8-5 GB point cloud cannot ride a single HTTP request: any proxy with a
+// 60-second body timeout kills the transfer mid-stream ("connection stalled")
+// and the whole upload restarts. Instead the file is sent in ~8 MiB parts —
+// small enough to finish inside any body-timeout window, cheap to retry. The
+// server acknowledges which parts it holds, so a stalled or refreshed session
+// resumes from the last acknowledged part instead of re-sending 5 GB.
+//
+// When the backend is configured with S3 credentials it presigns part URLs and
+// the browser PUTs directly to object storage: the app server never streams
+// file bytes at all (see docs/UPLOADS.md for the bucket CORS/ETag setup).
+// ---------------------------------------------------------------------------
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Stable per-file upload id (FNV-1a over name+size+mtime): retrying or
+ * refreshing yields the SAME session id, so the server-side session resumes. */
+function uploadIdFor(file: File): string {
+  const str = `${file.name}:${file.size}:${file.lastModified}`;
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    hash ^= str.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0") + file.size.toString(16).padStart(8, "0");
+}
+
+/** PUT one part with retry + exponential backoff; 5xx/network failures retry,
+ * 4xx fails fast (bad signature, wrong part number). */
+async function putWithRetry(
+  url: string,
+  blob: Blob,
+  timeoutMs = 120000,
+  attempts = 5
+): Promise<Response> {
+  let lastError: unknown = null;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, {
+        method: "PUT",
+        body: blob,
+        signal: controller.signal,
+      });
+      window.clearTimeout(timer);
+      if (response.ok) return response;
+      if (response.status < 500) {
+        throw new Error(`Upload part rejected (HTTP ${response.status})`);
+      }
+      lastError = new Error(`Upload part failed (HTTP ${response.status})`);
+    } catch (err) {
+      window.clearTimeout(timer);
+      if (err instanceof Error && err.message.startsWith("Upload part rejected")) throw err;
+      lastError = err;
+    }
+    if (attempt < attempts) await sleep(Math.min(30000, 1000 * 2 ** attempt));
+  }
+  throw lastError instanceof Error ? lastError : new Error("Upload part failed after retries");
+}
+
+export interface UploadProgress {
+  uploadedBytes: number;
+  totalBytes: number;
+  part: number;
+  parts: number;
+}
+
+/**
+ * Chunked, resumable upload of a LAS/LAZ file into a project.
+ * Returns the updated project once the server has assembled input.las.
+ */
+export async function uploadLasChunked(
+  projectId: string,
+  file: File,
+  onProgress?: (p: UploadProgress) => void
+): Promise<Project> {
+  // 1. Create (or resume) the session.
+  const uploadId = uploadIdFor(file);
+  const start = await request<{
+    upload_id: string;
+    storage: "local" | "s3";
+    chunk_size: number;
+    chunk_count: number;
+  }>(`/api/projects/${projectId}/uploads`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      filename: file.name,
+      total_size: file.size,
+      upload_id: uploadId,
+    }),
+  });
+
+  const { chunk_size: chunkSize, chunk_count: parts, storage } = start;
+
+  // 2. Ask which parts the server/storage already holds (resume support).
+  const status = await request<{ parts_received: number[] }>(
+    `/api/projects/${projectId}/uploads/${uploadId}`
+  );
+  const received = new Set(status.parts_received ?? []);
+  const ackedBytes = (n: number) =>
+    Math.min(n * chunkSize, file.size);
+
+  const s3Parts: { PartNumber: number; ETag: string }[] = [];
+
+  // 3. Send every missing part.
+  for (let part = 1; part <= parts; part++) {
+    if (received.has(part)) {
+      onProgress?.({
+        uploadedBytes: ackedBytes(part),
+        totalBytes: file.size,
+        part,
+        parts,
+      });
+      continue;
+    }
+    const blob = file.slice((part - 1) * chunkSize, Math.min(part * chunkSize, file.size));
+    if (storage === "s3") {
+      // Direct browser -> S3: the app server only signs the URL.
+      const { urls } = await request<{ urls: Record<string, string> }>(
+        `/api/projects/${projectId}/uploads/${uploadId}/presign`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ part_numbers: [part] }),
+        }
+      );
+      const response = await putWithRetry(urls[String(part)], blob);
+      const etag = response.headers.get("ETag") ?? response.headers.get("etag") ?? "";
+      if (!etag) {
+        throw new Error(
+          "Storage did not return an ETag for a part. Ensure the bucket CORS config exposes the ETag header (see docs/UPLOADS.md)."
+        );
+      }
+      s3Parts.push({ PartNumber: part, ETag: etag });
+    } else {
+      const form = new FormData();
+      form.append("file", blob, `part-${part}`);
+      await request(
+        `/api/projects/${projectId}/uploads/${uploadId}/part/${part}`,
+        { method: "PUT", body: form },
+        120000
+      );
+    }
+    onProgress?.({
+      uploadedBytes: ackedBytes(part),
+      totalBytes: file.size,
+      part,
+      parts,
+    });
+  }
+
+  // 4. Assemble (or finalize the S3 multipart upload). May take a while on
+  // multi-GB local assembly, so allow a generous single-call timeout.
+  const project = await request<Project>(
+    `/api/projects/${projectId}/uploads/${uploadId}/complete`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(storage === "s3" ? { parts: s3Parts } : {}),
+    },
+    600000
+  );
+  return project;
+}
+
 export const api = {
   health: () => request<{ status: string; version: string }>("/api/health"),
 
@@ -43,14 +230,14 @@ export const api = {
       method: "POST",
     }),
 
-  uploadLas: (projectId: string, file: File) => {
-    const form = new FormData();
-    form.append("file", file);
-    return request<Project>(`/api/projects/${projectId}/upload`, {
-      method: "POST",
-      body: form,
-    });
-  },
+  // Chunked + resumable: multi-GB LAS/LAZ uploads survive stalls, refreshes,
+  // and proxy body-timeouts (each part is one small request). Optional
+  // onProgress reports {uploadedBytes, totalBytes, part, parts}.
+  uploadLas: (
+    projectId: string,
+    file: File,
+    onProgress?: (p: UploadProgress) => void
+  ) => uploadLasChunked(projectId, file, onProgress),
 
   process: (
     projectId: string,
@@ -64,8 +251,9 @@ export const api = {
 
   job: (jobId: string) => request<JobStatus>(`/api/jobs/${jobId}`),
 
+  // Viewer payloads for real scans can be tens of MB; give the transfer room.
   viewerData: (projectId: string) =>
-    request<ViewerData>(`/api/projects/${projectId}/viewer-data`),
+    request<ViewerData>(`/api/projects/${projectId}/viewer-data`, undefined, 180000),
 
   simulate: () => request<Project>("/api/simulate", { method: "POST" }),
 

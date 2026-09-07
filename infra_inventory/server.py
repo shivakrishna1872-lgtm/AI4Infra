@@ -22,18 +22,22 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+import os
 
 from . import __version__
 from .models import ProcessingSettings
 from .pipeline import process_las
 from .simulation import run_quick_simulation, run_data_simulation, run_small_synthetic
+from . import upload_store
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "appdata"
 
@@ -58,8 +62,93 @@ def _write_job(job: dict) -> None:
     path = _job_file(job["id"])
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(job, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    try:
+        tmp.write_text(json.dumps(job, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+#: Minimum free bytes required before a processing job will start. Jobs stream
+#: multi-GB tiles to DATA_DIR, so starting one on a nearly full disk just turns
+#: into a crash mid-way; we fail fast with a clear message instead.
+MIN_FREE_DISK_BYTES = 512 * 1024 * 1024
+
+
+def _free_disk_bytes() -> int:
+    try:
+        return shutil.disk_usage(DATA_DIR).free
+    except OSError:
+        return MIN_FREE_DISK_BYTES  # unknown -> let the run proceed and surface real errors
+
+
+def _cleanup_stale_job_files() -> None:
+    """Remove leftover atomic-write .tmp files and stale job json at startup."""
+    jobs_dir = DATA_DIR / "jobs"
+    if not jobs_dir.is_dir():
+        return
+    for path in jobs_dir.glob("*.tmp"):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+_TERMINAL_STAGES = {"done", "error"}
+
+#: /api/simulate/data processes inline inside the request; above this size the
+#: client must use the resumable chunked upload + async process job instead.
+SIMULATE_SYNC_MAX_BYTES = 128 * 1024 * 1024
+
+
+def _active_job_for_project(project_id: str) -> Optional[str]:
+    """Return the id of a running (non-terminal) job for a project, if any.
+
+    Checks both the in-memory registry and the persisted job files so a
+    restarted server still refuses to double-process a project whose previous
+    run is alive. A stale record that stopped updating is treated as dead.
+    """
+    now = time.time()
+    with _JOBS_LOCK:
+        for job_id, job in _JOBS.items():
+            if job.get("project_id") == project_id and job.get("stage") not in _TERMINAL_STAGES:
+                return job_id
+    jobs_dir = DATA_DIR / "jobs"
+    if jobs_dir.is_dir():
+        for path in jobs_dir.glob("*.json"):
+            try:
+                job = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if job.get("project_id") != project_id:
+                continue
+            if job.get("stage") in _TERMINAL_STAGES:
+                continue
+            age = now - float(job.get("updated_at") or 0.0)
+            if age < 90.0:
+                return path.stem
+    return None
+
+
+def _disk_full_message() -> str:
+    free_mb = _free_disk_bytes() // (1024 * 1024)
+    return (
+        "Out of disk space while processing (only ~"
+        f"{free_mb} MB free). Delete old projects from the Projects list "
+        "(or remove appdata/projects/* on the server), then retry."
+    )
+
+
+def _ensure_disk_headroom() -> None:
+    """Fail fast with a clear 507 instead of crashing mid-write with Errno 28."""
+    free = _free_disk_bytes()
+    if free < MIN_FREE_DISK_BYTES:
+        raise HTTPException(
+            status_code=507,
+            detail=_disk_full_message(),
+        )
+
 
 app = FastAPI(
     title="AI4Infra",
@@ -73,11 +162,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# The viewer payload for real scans is tens of MB of JSON; compress it so the
+# hosted preview tunnel (and slow clients) don't stall on a 44 MB transfer.
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+
+@app.on_event("startup")
+def _startup() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _cleanup_stale_job_files()
+    removed = upload_store.prune_stale_sessions()
+    if removed:
+        print(f"upload sessions pruned: {removed}", flush=True)
+
 
 STAGES = [
     "validating",
     "streaming",
     "pointcept",
+    "openpcseg",
     "roadmarking",
     "detecting",
     "exporting",
@@ -104,6 +207,29 @@ class ProjectInfo(BaseModel):
 class ProcessRequest(BaseModel):
     tile_size_m: Optional[float] = None
     viewer_point_limit: Optional[int] = None
+    #: "auto" (default) uses Gemini validation when GEMINI_API_KEY is set;
+    #: True/False force it on/off regardless of the environment.
+    use_gemini: Optional[str] = None
+
+
+def _web_settings(
+    use_gemini: Optional[bool] = None, gemini_model: Optional[str] = None
+) -> ProcessingSettings:
+    """Settings shared by every web processing path (upload/process/simulate).
+
+    Web jobs always: drop multi-GB tile intermediates, raise the viewer LOD
+    budget, and enable the Gemini class-validation booster when the API key is
+    present in the environment (the booster degrades to geometry-only with a
+    recorded warning when the key is missing or invalid — the pipeline never
+    depends on the network)."""
+    settings = ProcessingSettings()
+    settings.save_tiles = False  # never keep multi-GB tile intermediates in web runs
+    settings.viewer_point_limit = 250_000
+    key = os.environ.get("GEMINI_API_KEY")
+    settings.backend = "gemini" if (key and use_gemini is not False) else "geometry"
+    if gemini_model:
+        settings.gemini_model = gemini_model
+    return settings
 
 
 def _project_dir(project_id: str) -> Path:
@@ -210,10 +336,247 @@ async def upload_las(project_id: str, file: UploadFile = File(...)) -> ProjectIn
     return _project_info(meta)
 
 
+# ---------------------------------------------------------------------------
+# Resumable chunked uploads (3.8-5 GB LAS/LAZ never rides a single request).
+#
+#   POST /api/projects/{id}/uploads            -> create/resume a session
+#   PUT  /api/projects/{id}/uploads/{uid}/part/{n}  -> send one chunk (local)
+#   POST /api/projects/{id}/uploads/{uid}/presign   -> direct-to-S3 part URLs
+#   GET  /api/projects/{id}/uploads/{uid}           -> which parts arrived
+#   POST /api/projects/{id}/uploads/{uid}/complete  -> assemble input.las
+#   DELETE /api/projects/{id}/uploads/{uid}         -> cancel session
+#
+# Each PUT is one ~8 MiB request: fast enough to finish inside any proxy's
+# body timeout, small enough that a stalled chunk costs one retry, not 5 GB.
+# With S3 configured the browser instead PUTs presigned URLs directly to the
+# bucket, so the app server never streams file bytes at all.
+# ---------------------------------------------------------------------------
+
+
+def _upload_error(exc: "upload_store.UploadError") -> HTTPException:
+    return HTTPException(status_code=exc.status_code, detail=str(exc))
+
+
+class UploadStartRequest(BaseModel):
+    filename: str
+    total_size: int
+    upload_id: Optional[str] = None  # client-generated id enables resume
+    mode: str = "multipart"  # "multipart" (resumable parts) | "put" (one presigned PUT)
+
+
+class PresignRequest(BaseModel):
+    part_numbers: List[int]
+
+
+class CompleteUploadRequest(BaseModel):
+    # s3 mode: the browser reports [{PartNumber, ETag}, ...]; local mode ignores it.
+    parts: Optional[List[Dict[str, Any]]] = None
+    # Kick off the processing job in the same response (still async: the job
+    # runs in the background worker; the HTTP call only queues it).
+    auto_process: Optional[bool] = None
+
+
+@app.post("/api/projects/{project_id}/uploads")
+def create_upload(project_id: str, request: UploadStartRequest) -> dict:
+    if request.total_size <= 0:
+        raise HTTPException(status_code=400, detail="total_size must be positive")
+    try:
+        manifest = upload_store.init_upload(
+            project_id=project_id,
+            filename=request.filename,
+            total_size=request.total_size,
+            upload_id=request.upload_id or uuid.uuid4().hex[:16],
+        )
+    except upload_store.UploadError as exc:
+        raise _upload_error(exc) from exc
+    # "put" mode: hand back ONE presigned PUT URL so the browser uploads the
+    # whole object straight to storage (the <1s URL request -> direct PUT
+    # architecture). The S3 event notification then triggers processing.
+    if request.mode == "put" and manifest["storage"] == "s3":
+        try:
+            presigned = upload_store.presign_put(project_id, manifest["upload_id"])
+        except upload_store.UploadError as exc:
+            raise _upload_error(exc) from exc
+        return {**manifest, **presigned}
+    return manifest
+
+
+@app.put("/api/projects/{project_id}/uploads/{upload_id}/part/{part_number}")
+def upload_part(project_id: str, upload_id: str, part_number: int, file: UploadFile = File(...)) -> dict:
+    """Receive one chunk (local-storage mode). Kept sync so Starlette streams
+    it to disk without buffering the chunk twice in memory."""
+    try:
+        data = file.file.read()
+        return upload_store.store_part(project_id, upload_id, part_number, data)
+    except upload_store.UploadError as exc:
+        raise _upload_error(exc) from exc
+
+
+@app.post("/api/projects/{project_id}/uploads/{upload_id}/presign")
+def presign_parts(project_id: str, upload_id: str, request: PresignRequest) -> dict:
+    try:
+        urls = upload_store.presign_parts(project_id, upload_id, request.part_numbers)
+        return {"urls": {str(n): u for n, u in urls.items()}}
+    except upload_store.UploadError as exc:
+        raise _upload_error(exc) from exc
+
+
+@app.get("/api/projects/{project_id}/uploads/{upload_id}/put-url")
+def presign_put(project_id: str, upload_id: str) -> dict:
+    """Single presigned PUT for the whole object (two-step direct upload)."""
+    try:
+        return upload_store.presign_put(project_id, upload_id)
+    except upload_store.UploadError as exc:
+        raise _upload_error(exc) from exc
+
+
+@app.get("/api/projects/{project_id}/uploads/{upload_id}")
+def upload_session_status(project_id: str, upload_id: str) -> dict:
+    try:
+        return upload_store.upload_status(project_id, upload_id)
+    except upload_store.UploadError as exc:
+        raise _upload_error(exc) from exc
+
+
+@app.post("/api/projects/{project_id}/uploads/{upload_id}/complete")
+def complete_upload(project_id: str, upload_id: str, request: CompleteUploadRequest) -> ProjectInfo:
+    """Assemble the uploaded object into input.las. Processing stays a separate
+    async job (202-style): this call returns as soon as the file is in place."""
+    _ensure_disk_headroom()
+    try:
+        result = upload_store.complete_upload(
+            project_id,
+            upload_id,
+            _project_dir(project_id) / "input.las",
+            parts=request.parts,
+        )
+    except upload_store.UploadError as exc:
+        raise _upload_error(exc) from exc
+    meta = _read_project(project_id)
+    meta["input_file"] = result["filename"]
+    meta["input_size_bytes"] = result["size"]
+    meta["uploaded_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    meta["upload_storage"] = result["storage"]
+    if result.get("sha256"):
+        meta["input_sha256"] = result["sha256"]
+    if result.get("external"):
+        # events mode: the object stays in the bucket; the processing worker
+        # fetches it at job start (server-side transfer, inside the DC).
+        meta["input_external"] = {
+            "bucket": os.environ.get("S3_BUCKET"),
+            "key": result.get("s3_key"),
+        }
+    meta.pop("processed", None)
+    _save_project(project_id, meta)
+    job_id = None
+    if request.auto_process:
+        settings = _web_settings()
+        try:
+            job_id = _launch_job(project_id, settings)
+        except HTTPException:
+            pass  # active job / missing input: surface via /process endpoints
+    info = _project_info(meta)
+    if job_id:
+        info.summary = {**(info.summary or {}), "job_id": job_id}
+    return info
+
+
+@app.delete("/api/projects/{project_id}/uploads/{upload_id}")
+def abort_upload_session(project_id: str, upload_id: str) -> dict:
+    try:
+        upload_store.abort_upload(project_id, upload_id)
+        return {"aborted": upload_id}
+    except upload_store.UploadError as exc:
+        raise _upload_error(exc) from exc
+
+
+# ---------------------------------------------------------------------------
+# Storage event webhook (requirement 3): after the browser uploads directly to
+# S3, an S3 Event Notification (or any webhook bridge) POSTs here and the
+# project becomes processable — with zero file bytes through the app server.
+#
+# S3 console: bucket -> Properties -> Event notifications -> "All object create
+# events" -> destination: this endpoint via SNS topic (HTTP subscription) or an
+# EventBridge -> API destination. See docs/UPLOADS.md for the click-path.
+# ---------------------------------------------------------------------------
+
+
+def _iter_storage_events(payload: Dict[str, Any]):
+    """Yield (bucket, key, size) from SNS-wrapped, raw S3, or simplified JSON."""
+    message = payload.get("Message")  # SNS envelope carries a JSON string
+    if isinstance(message, str):
+        try:
+            payload = json.loads(message)
+        except ValueError:
+            pass
+    records = payload.get("Records") or []
+    if not records and payload.get("bucket") and payload.get("key"):
+        records = [{"s3": {"bucket": {"name": payload["bucket"]}, "object": {"key": payload["key"], "size": payload.get("size")}}}]
+    for record in records:
+        s3 = record.get("s3") or {}
+        bucket = (s3.get("bucket") or {}).get("name")
+        key = (s3.get("object") or {}).get("key")
+        if not bucket or not key:
+            continue
+        from urllib.parse import unquote
+
+        yield bucket, unquote(key), (s3.get("object") or {}).get("size")
+
+
+@app.post("/api/storage/events")
+async def storage_event_webhook(request: Request) -> dict:
+    """Accept S3/SNS ObjectCreated notifications and ingest matched sessions.
+
+    Unknown keys return 200 with matched=0 (shared buckets fire events for
+    unrelated objects; failing them would just trigger delivery retries).
+    Set ACTIVE_PROCESSING=1 to auto-start the processing job on every ingest.
+    """
+    body = await request.body()
+    try:
+        payload = json.loads(body or b"{}")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Event body must be JSON")
+    matched, ignored = [], 0
+    bucket_env = os.environ.get("S3_BUCKET")
+    for bucket, key, size in _iter_storage_events(payload):
+        if bucket_env and bucket != bucket_env:
+            ignored += 1
+            continue
+        try:
+            summary = upload_store.ingest_external_object(bucket, key)
+        except upload_store.UploadError:
+            ignored += 1
+            continue
+        if size:
+            summary["total_size"] = size
+        project_id = summary["project_id"]
+        meta = _read_project(project_id)
+        meta["input_file"] = summary["filename"]
+        meta["input_size_bytes"] = size or summary.get("total_size")
+        meta["uploaded_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        meta["upload_storage"] = "s3"
+        meta["input_external"] = {"bucket": bucket, "key": key}
+        meta.pop("processed", None)
+        _save_project(project_id, meta)
+        job_id = None
+        if os.environ.get("ACTIVE_PROCESSING", "").lower() in ("1", "true", "yes"):
+            try:
+                job_id = _launch_job(project_id, _web_settings())
+            except HTTPException:
+                job_id = None
+        summary["job_id"] = job_id
+        matched.append(summary)
+    return {"matched": len(matched), "ingested": matched, "ignored": ignored}
+
+
 def _run_job(project_id: str, job_id: str, settings: ProcessingSettings) -> None:
     directory = _project_dir(project_id)
     output = directory / "output"
     input_path = directory / "input.las"
+    # Fresh run: never append into a stale/partial previous output (partial tile
+    # files from a crashed earlier run would corrupt this one).
+    if output.exists():
+        shutil.rmtree(output, ignore_errors=True)
 
     def report(payload: dict) -> None:
         with _JOBS_LOCK:
@@ -244,6 +607,12 @@ def _run_job(project_id: str, job_id: str, settings: ProcessingSettings) -> None
             })
             snapshot = dict(_JOBS[job_id])
         _write_job(snapshot)
+    except OSError as exc:  # pragma: no cover - defensive
+        message = _disk_full_message() if exc.errno == 28 else str(exc)
+        with _JOBS_LOCK:
+            _JOBS[job_id].update({"stage": "error", "message": message})
+            snapshot = dict(_JOBS[job_id])
+        _write_job(snapshot)
     except Exception as exc:  # pragma: no cover - defensive
         with _JOBS_LOCK:
             _JOBS[job_id].update({"stage": "error", "message": str(exc)})
@@ -253,16 +622,28 @@ def _run_job(project_id: str, job_id: str, settings: ProcessingSettings) -> None
 
 @app.post("/api/projects/{project_id}/process")
 def start_process(project_id: str, request: ProcessRequest) -> dict:
+    _ensure_disk_headroom()
     meta = _read_project(project_id)
     directory = _project_dir(project_id)
     input_path = directory / "input.las"
     if not input_path.is_file():
         raise HTTPException(status_code=400, detail="Upload a LAS file before processing")
-    settings = ProcessingSettings()
+    settings = _web_settings(
+        use_gemini=None if request.use_gemini is None else request.use_gemini not in ("false", "0", "off", "False"),
+    )
     if request.tile_size_m:
         settings.tile_size_m = request.tile_size_m
     if request.viewer_point_limit:
         settings.viewer_point_limit = request.viewer_point_limit
+    # Refuse to run two jobs on the same project: the second run rmtree's the
+    # first one's output dir out from under it, orphaning a zombie thread that
+    # spins forever on missing tiles and steals CPU from real jobs.
+    active = _active_job_for_project(project_id)
+    if active is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"This project is already being processed (job {active}). Wait for it to finish or delete the project.",
+        )
     job_id = uuid.uuid4().hex[:12]
     with _JOBS_LOCK:
         _JOBS[job_id] = {
@@ -289,51 +670,74 @@ def simulate_data(upload: UploadFile = File(...)) -> ProjectInfo:
     """Data-dependent simulation: upload a real LAS/LAZ, process it, get a project."""
     if not upload.filename or not upload.filename.lower().endswith((".las", ".laz")):
         raise HTTPException(status_code=400, detail="Only .las / .laz files are accepted")
+    _ensure_disk_headroom()
+    # Large captures must not ride this single synchronous request: a 3.8-5 GB
+    # body risks the proxy body-timeout ("connection stalled"). Route them to
+    # the resumable chunked path instead (identical processing downstream).
+    upload.file.seek(0, 2)
+    upload_size = upload.file.tell()
+    upload.file.seek(0)
+    if upload_size > SIMULATE_SYNC_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"File is ~{upload_size // (1024 * 1024)} MiB - too large for the "
+                "synchronous data-simulation request (proxies kill long uploads). "
+                "Create a project, upload via POST /api/projects/{id}/uploads "
+                "(chunked + resumable), then POST /api/projects/{id}/process. "
+                "The pipeline result is identical."
+            ),
+        )
     project_id = uuid.uuid4().hex[:12]
     directory = _project_dir(project_id)
     directory.mkdir(parents=True, exist_ok=True)
     target = directory / "input.las"
     with target.open("wb") as handle:
         shutil.copyfileobj(upload.file, handle)
-    settings = ProcessingSettings()
-    settings.viewer_point_limit = 250000
+    settings = _web_settings()
+    output = directory / "output"
     try:
-        project = run_data_simulation(target, directory, settings=settings)
+        # Process directly into the project output (no run-dir + copytree, which
+        # used to double the disk footprint of large uploads).
+        from .validation import validate_las
+
+        summary = process_las(target, output, settings, progress=False)
+        metadata = validate_las(target).metadata
     except Exception as exc:  # pragma: no cover - defensive
         raise HTTPException(status_code=500, detail=f"Data simulation failed: {exc}")
-
-    # Stage into the standard project layout so exports/viewer endpoints work.
-    run_dir = Path(project["output_dir"]) / "pipeline"
-    output = directory / "output"
-    if run_dir.is_dir():
-        if output.exists():
-            shutil.rmtree(output)
-        shutil.copytree(run_dir, output)
+    input_size_bytes = target.stat().st_size if target.is_file() else None
     meta = {
         "id": project_id,
-        "name": project["name"],
+        "name": f"Data Simulation · {upload.filename}",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "simulated": True,
-        "input_file": project.get("input_file_name"),
-        "input_size_bytes": project.get("input_size_bytes"),
-        "point_count": project["point_count"],
-        "crs": project["crs"],
-        "las_version": project["las_version"],
-        "point_format": project["point_format"],
-        "asset_count": project["asset_count"],
-        "backend": project.get("backend", {}),
-        "run_count": project.get("run_count", 0),
-        "scanner_ids": project.get("scanner_ids", []),
-        "source_kind": project.get("source_kind", "Data Simulation"),
+        "input_file": upload.filename,
+        "input_size_bytes": input_size_bytes,
+        "point_count": summary.point_count,
+        "crs": summary.crs,
+        "las_version": summary.las_version,
+        "point_format": summary.point_format,
+        "asset_count": len(summary.assets),
+        "backend": summary.backend,
+        "run_count": summary.run_count,
+        "scanner_ids": summary.scanner_ids,
+        "source_kind": "Data Simulation",
         "processed": True,
         "output_dir": str(output),
         "simulation_source_file": str(target),
-        "warnings": project.get("warnings", []),
-        "processing_version": project.get("processing_version", "0.3.0"),
-        "elapsed_seconds": project.get("elapsed_seconds", 0.0),
-        "scene": project.get("scene_summary", {}),
+        "warnings": summary.warnings,
+        "processing_version": summary.processing_version,
+        "elapsed_seconds": round(summary.elapsed_seconds, 2),
+        "scene": None,
         "simulation_note": "DATA SIMULATION - uploaded LiDAR processed through the pipeline.",
-        "simulation_meta": project.get("simulation_meta"),
+        "simulation_meta": {
+            "source_file": str(target),
+            "crs": metadata.crs,
+            "las_version": metadata.version,
+            "point_format": metadata.point_format,
+            "point_count": metadata.point_count,
+            "note": "DATA SIMULATION - uploaded LiDAR processed through the pipeline.",
+        },
     }
     _save_project(project_id, meta)
     return _project_info(meta)
@@ -406,11 +810,11 @@ def simulate() -> ProjectInfo:
     """Quick Simulation: generate a synthetic mobile-LiDAR scene and process it
     through the real pipeline - no uploaded file required (SIMULATION ONLY).
     """
+    _ensure_disk_headroom()
     project_id = uuid.uuid4().hex[:12]
     directory = _project_dir(project_id)
     directory.mkdir(parents=True, exist_ok=True)
-    settings = ProcessingSettings()
-    settings.viewer_point_limit = 250000
+    settings = _web_settings()
     try:
         project = run_quick_simulation(directory, settings=settings)
     except Exception as exc:  # pragma: no cover - defensive

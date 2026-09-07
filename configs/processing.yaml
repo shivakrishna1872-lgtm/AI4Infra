@@ -8,17 +8,26 @@
 chunk_size: 500000          # points per streaming chunk (never load the whole cloud)
 tile_size_m: 40.0           # spatial tile edge length in metres
 tile_overlap_m: 0.0         # 0 = non-overlapping tiles (boundary instances are QC-deduped)
-viewer_point_limit: 120000  # points sampled for the 3D viewer
+viewer_point_limit: 120000  # LOD background cloud target after voxel downsampling
+viewer_payload_max_bytes: 9000000  # hard cap on viewer-data.json (browser payload stays <10 MB)
 point_index_sample_limit: 256
 save_tiles: true            # persist per-tile LAS files under output/tiles/
+max_input_points: 0         # >0 uniformly thins larger inputs (las2las -thin analogue)
+review_confidence_threshold: 0.8  # assets below this confidence go to human review
 
 # --- Backends ---
-backend: geometry           # geometry | pointcept
+backend: geometry           # geometry | pointcept | openpcseg | gemini (LLM booster; needs GEMINI_API_KEY)
+gemini_model: gemini-3.6-flash
 pointcept_root: null
 pointcept_config: null
 pointcept_weight: null
 pointcept_class_names: null # JSON file: taxonomy of the pointcept config, in class-id order
 pointcept_num_gpus: 1
+openpcseg_root: null        # OpenPCSeg checkout (BAI-Yeqi/OpenPCSeg; see docs/LEARNED_MODELS.md)
+openpcseg_config: null      # OpenPCSeg config .yaml (tools/cfgs/...)
+openpcseg_weight: null      # checkpoint .pth (model zoo: python -m infra_inventory download-models)
+openpcseg_taxonomy: toronto3d  # toronto3d (fine-tuned, 9 ids) | semantickitti (model zoo, 20 ids)
+openpcseg_num_gpus: 1
 roadmarking_command: null   # path to the RoadMarkingExtraction run script (opt-in)
 roadmarking_config: null    # path to its parameter config
 
@@ -50,10 +59,10 @@ pole_min_columnarity: 0.15
 pole_min_points: 40
 pole_resolution_m: 0.45
 conductor_min_height_m: 4.0
-conductor_min_length_m: 8.0
+conductor_min_length_m: 5.0
 conductor_max_width_m: 0.6
-conductor_max_height_extent_m: 2.5
-conductor_min_points: 60
+conductor_max_height_extent_m: 3.5
+conductor_min_points: 15
 conductor_resolution_m: 0.5
 cabinet_min_height_m: 0.4
 cabinet_max_height_m: 3.0

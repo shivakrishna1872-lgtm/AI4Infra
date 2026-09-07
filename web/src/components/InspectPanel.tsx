@@ -54,6 +54,21 @@ export default function InspectPanel({ asset, onClose, onFocus, onToggleHidden, 
           </div>
         </div>
 
+        {asset.condition && (
+          <div className={`alp alp-${(asset.condition ?? "").toLowerCase()}`}>
+            <div className="alp-row">
+              <span className={`cond cond-${(asset.condition ?? "").toLowerCase()}`}>
+                {asset.condition}
+              </span>
+              {asset.review_required && <span className="cond cond-review">REVIEW</span>}
+            </div>
+            {asset.recommended_action && <div className="alp-action">{asset.recommended_action}</div>}
+            {asset.assessment_reasoning && (
+              <div className="alp-reason">{asset.assessment_reasoning}</div>
+            )}
+          </div>
+        )}
+
         <dl className="kv">
           <dt>Geometry</dt>
           <dd>

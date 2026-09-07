@@ -49,10 +49,108 @@ class_mapping:
     note: "Context only - do not label as travelled surface."
   terrain:
     asset_class: null
-    weight: 0.0
-    note: "Context only."
+    weight: 0.1
+    note: "Weak ground-context evidence (pavement decision from geometry)."
   vegetation:
     asset_class: null
     weight: 0.0
     note: "Context only."
   # Other nuScenes classes (vehicles, pedestrians, ...) never map to assets.
+
+# ---------------------------------------------------------------------------
+# OpenPCSeg backends (MinkowskiNet / SPVCNN / Cylinder3D).
+# ---------------------------------------------------------------------------
+openpcseg:
+  source: https://github.com/BAI-Yeqi/OpenPCSeg
+  entrypoints: "infer.py / train.py (--cfg_file, --ckp, --set KEY VALUE)"
+  gpu: required (torchsparse / MinkowskiEngine CUDA ops)
+
+  # --- Taxonomy A: Toronto-3D (fine-tuned on mobile-LiDAR road survey) ---
+  # Upstream class ids (WeikaiTan/Toronto-3D README): Road 1, Road marking 2,
+  # Natural 3, Building 4, Utility line 5, Pole 6, Car 7, Fence 8,
+  # unclassified 0. This is the closest public analogue to the MX9 capture.
+  toronto3d:
+    class_names: [unclassified, road, road_marking, natural, building, utility_line, pole, car, fence]
+    model_zoo:
+      randla-net-xyz:  {miou: 77.71, source: "https://github.com/WeikaiTan/RandLA-Net"}
+      randla-net-rgb:  {miou: 81.77, source: "https://github.com/WeikaiTan/RandLA-Net"}
+    train_tiles: [L001, L003, L004]
+    test_tile: L002
+    preparation_script: scripts/prepare_toronto3d.py
+
+  # --- Taxonomy B: SemanticKITTI (model-zoo pretrained weights) ---
+  # OpenPCSeg's downloadable checkpoints are trained on SemanticKITTI
+  # (car_c 0, bicycle 1, motorcycle 2, truck 3, other-vehicle 4, person 5,
+  # bicyclist 6, motorcyclist 7, road 8, parking 9, sidewalk 10,
+  # other-ground 11, building 12, fence 13, vegetation 14, trunk 15,
+  # terrain 16, pole 17, traffic-sign 18, other-object 19; IGNORE_LABEL 0).
+  semantickitti:
+    class_names: [car_c, bicycle, motorcycle, truck, other-vehicle, person, bicyclist, motorcyclist, road, parking, sidewalk, other-ground, building, fence, vegetation, trunk, terrain, pole, traffic-sign, other-object]
+    model_zoo:
+      minkunet_mk34_cr10: {miou: 70.04, url: "https://www.dropbox.com/s/a9gjxeziy6rbiui/semkitti_minkunet_mk34_cr16_checkpoint_epoch_36.pth?dl=0"}
+      spvcnn_mk18_cr10:   {miou: 68.58, url: "https://www.dropbox.com/s/94j8rxkxlo2j924/semkitti_spvcnn_mk18_cr10_checkpoint_epoch_36.pth?dl=0"}
+      cylinder3d_cy480:   {miou: 66.07, url: "https://www.dropbox.com/s/imtcmn9z4qldc2h/semkitti_cylinder_cy480_cr10_checkpoint_epoch_35.pth?dl=0"}
+
+  # Shared decision table: upstream class -> infrastructure evidence.
+  # `asset_class: null` = context only (never creates an asset by itself).
+  class_mapping:
+    road:
+      asset_class: pavement
+      subclass: travelled_surface
+      weight: 0.90
+      note: "Direct semantic evidence for the travelled surface."
+    road_marking:
+      asset_class: pavement_marking
+      weight: 0.85
+      note: "Direct semantic evidence for paint; geometry still confirms linearity."
+    utility_line:
+      asset_class: overhead_conductor
+      weight: 0.85
+      note: "Direct semantic evidence for overhead wires."
+    pole:
+      asset_class: utility_pole
+      weight: 0.85
+      note: "Direct semantic evidence for poles; signs on posts get weak evidence too."
+    fence:
+      asset_class: safety_barrier
+      weight: 0.55
+      evidence_for: [guardrail]
+      note: "Weak evidence — guardrails/barriers confirmed by cross-section geometry."
+    building:
+      asset_class: utility_cabinet
+      weight: 0.10
+      note: "Very weak: cabinets are boxy like small structures; geometry decides."
+    terrain:
+      asset_class: null
+      weight: 0.1
+      note: "Ground context only."
+    natural:
+      asset_class: null
+      weight: 0.0
+      note: "Context only."
+    car:
+      asset_class: null
+      weight: 0.0
+      note: "Vehicles never map to assets."
+    # SemanticKITTI-specific additions (shared table covers Toronto-3D ids).
+    traffic-sign:
+      asset_class: traffic_sign
+      weight: 0.85
+      note: "Direct semantic evidence for sign panels."
+    parking:
+      asset_class: null
+      weight: 0.05
+      note: "Ground context only."
+    sidewalk:
+      asset_class: null
+      weight: 0.05
+      note: "Context only - not the travelled surface."
+    trunk:
+      asset_class: null
+      weight: 0.2
+      evidence_for: [utility_pole]
+      note: "Vertical-column evidence only; poles confirmed by geometry."
+    vegetation:
+      asset_class: null
+      weight: 0.0
+      note: "Context only."

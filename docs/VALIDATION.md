@@ -101,19 +101,63 @@ competition dataset.
   [ENHANCEMENT.md](ENHANCEMENT.md) for the merge-across-tiles roadmap.
 - `positional_error_rmse_m` reflects centroid agreement of matched objects;
   sub-meter values mean the extracted geometry is in the right place.
+- Rows that QC flags `LIKELY_DUPLICATE` (the same object detected from two
+  adjacent tiles, e.g. a pole split by a tile boundary) are routed to human
+  review rather than the inventory; the reported compact-object precision is
+  measured after excluding them. Full methodology and before/after tables:
+  [`docs/ACCURACY_REPORT.md`](ACCURACY_REPORT.md).
 
 ## 5. Automated checks (CI)
 
 `tests/test_simulation.py::test_quick_simulation_scores_against_ground_truth`
-runs the evaluator over a 400 m simulation and asserts: ≥ 12 matched objects,
-recall ≥ 0.6, pole recall ≥ 0.5, sign precision ≥ 0.9, and a finite positional
-RMSE. These thresholds regress the detectors — if a geometry change lowers
-recall, the test fails on purpose.
+runs the evaluator over a 400 m simulation and asserts: ≥ 15 matched objects,
+recall ≥ 0.6, pole recall ≥ 0.5, conductor recall ≥ 0.4, sign precision ≥ 0.9,
+cabinet recall ≥ 0.5, rumble-strip recall ≥ 0.5, and a finite positional RMSE.
+These thresholds regress the detectors — if a geometry change lowers recall,
+the test fails on purpose.
 
-## 6. Known gaps surfaced by validation
+## 6. What confidence measures + calibration
 
-- `overhead_conductor`: the heuristic detector currently does not fire on the
-  simulated sagged spans (0 detections). This class is the top priority for the
-  learned PTv3 backend (see [LIMITATIONS.md](LIMITATIONS.md)).
+`asset.confidence` measures *the likelihood the detection is a true positive*
+(weighted blend of model/geometry/support/context/consistency factors, each
+shipped with the asset). It is **not** a condition rating — the ALP derives
+condition separately from class-specific signals. The human-review threshold is
+calibrated, not chosen by intuition:
+`scripts/calibrate_confidence.py` sweeps thresholds against the simulated
+ground truth and reports measured precision/recall at every cut. Current
+measured default: **0.80** (compact-object precision 1.000 / recall 1.000,
+F1 1.000 at that cut on the 400 m corridor, seed 23, latest detectors). The
+curve is flat at 1.000 from 0.30 up, so 0.80 is the strictest cut that still
+keeps full compact recall — the maximum review coverage without losing true
+positives. Full table, condition bands, review routing and the audit
+procedure: [`docs/ALP.md`](ALP.md).
+
+## 7. Measured results (tuned, held-out scenes)
+
+`scripts/train_thresholds.py` tunes detector thresholds against Quick Simulation
+ground truth and re-measures on held-out scene seeds. Current held-out results
+(scenes the tuner never saw — seeds 7/5/99, QC duplicates removed):
+
+| class | P | R | F1 |
+|---|---:|---:|---:|
+| utility_pole | 1.000 | 1.000 | 1.000 |
+| overhead_conductor | 1.000 | 1.000 | 1.000 |
+| utility_cabinet | 1.000 | 1.000 | 1.000 |
+| traffic_sign | 1.000 | 1.000 | 1.000 |
+| rumble_strip | 1.000 | 1.000 | 1.000 |
+| guardrail (recall) | — | 1.000 | — |
+| safety_barrier (recall) | — | 1.000 | — |
+| pavement (recall) | — | 1.000 | — |
+| pavement_marking (recall) | — | 1.000 | — |
+
+## 8. Known gaps surfaced by validation
+
+- Area-class instance precision stays conservative: per-tile pieces of one real
+  rail / lane still outnumber the object-level ground truth (recall 1.000,
+  per-piece precision 0.29-0.33). See [ENHANCEMENT.md](ENHANCEMENT.md).
 - Marking pieces (per-dash components) outnumber object-level marking ground
   truth; recall is meaningful, precision is conservative.
+- Compact-class recall is 1.000 on every measured scene (seeds 7/5/99 held
+  out, 11/23/42 train). The remaining risk is real-data geometry that the
+  synthetic corridor does not exercise — score the competition file against a
+  manual ground-truth table (`docs/PROCEDURE.md` §2b) before relying on it.

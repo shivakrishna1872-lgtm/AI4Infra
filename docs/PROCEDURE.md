@@ -143,6 +143,31 @@ output/
 └── viewer/                 # dependency-free 3D viewer
 ```
 
+`viewer-data.json` is the only payload served to the browser and it is kept
+slim on purpose: a decimated overview cloud (≤ 120k points) plus whitelisted
+asset records (only the fields the 3D scene and inspector render, with capped
+highlight-point evidence). Full provenance per asset stays in `assets.json`,
+`inventory.json` and the per-asset files under `assets/`. The server also
+gzip-compresses it, so a multi-GB scan becomes a small JSON download.
+
+### 10b. MongoDB inventory mirror (optional)
+
+Every asset can also be mirrored to MongoDB as a GeoJSON document with the
+agency schema (`asset_id`, `category`, `subcategory`, `location` Point,
+`attributes` incl. `height_m` / `lean_angle_deg` / `run_source` / `condition`),
+plus confidence, QC flags, CRS and source provenance. A `2dsphere` index is
+created for spatial queries. Enable via `MONGO_URI` env (server or CLI) or:
+
+```bash
+python -m infra_inventory process data/mannford.las --output output/mannford \
+  --mongo-uri mongodb://localhost:27017
+```
+
+Requires `pip install -e '.[mongo]'`. The mirror never blocks the pipeline: a
+failed export becomes a run warning, and prior documents of the same source
+file are replaced so the collection mirrors the latest run. Full schema:
+`docs/ASSET_SCHEMA.md` §5.
+
 ## 11. Visualization
 
 ```bash
@@ -228,12 +253,60 @@ The project exports `simulation_meta.ground_truth` (the exact placed objects).
 Score the run against it with the snippet in `docs/VALIDATION.md` §2a, which
 reports Precision, Recall, F1, and positional RMSE per class.
 
+## 15b. ALP assessment, confidence calibration and human review
+
+Every asset is assessed by the ALP layer (`infra_inventory/assessment.py`): an
+Observation → Interpretation → Recommended Action record plus a review flag,
+exported as `condition`, `recommended_action`, `review_required`, and
+`assessment_reasoning` (docs/ALP.md). `reports/summary.md` includes the
+condition table and review count; `reports/qc_report.json` lists every asset
+that needs a human look.
+
+Calibrate the review threshold against ground truth instead of guessing:
+
+```bash
+python scripts/calibrate_confidence.py --length 400 --seed 23 --report reports/calibration.json
+```
+
+Set `review_confidence_threshold` in `configs/processing.yaml` to the
+recommended value and record the sweep in docs/ALP.md.
+
+## 15c. Disk space and very large files
+
+A ~16M-point tile needs several GB for per-tile intermediates. Three lines of
+defence:
+
+1. **Web/API runs clean up**: jobs process with `save_tiles=false`, so per-tile
+   LAS files are removed after processing (`run.json` records a warning).
+   Flat exports omit per-point `highlight_points` to stay slim; full evidence
+   lives in per-asset files and `viewer-data.json`.
+2. **The API fails fast**: below 512 MB free, processing returns a clear 507
+   message ("delete old projects…") instead of dying mid-write with
+   `Errno 28`.
+3. **Manual cleanup** when a run still fills the disk:
+
+```bash
+df -h                        # check free space
+ls appdata/projects/         # each dir = one uploaded/processed project
+rm -rf appdata/projects/<partial-or-failed-project-id>   # failed/partial runs
+rm -f appdata/jobs/*.tmp     # leftover atomic-write temp files
+```
+
+Delete old projects from the web UI (project → delete) before reprocessing big
+files. Never commit `.las`/`.laz` datasets.
+
 ## Known limitations (read before judging)
 
-* Instances crossing tile boundaries can be split into two assets; QC flags nearby
-  duplicates but does not merge across tiles yet.
+* Compact objects split by a tile boundary (e.g. a pole standing exactly on a
+  tile edge) are detected twice and flagged `LIKELY_DUPLICATE` for human review;
+  thin linear assets (overhead conductors) are re-joined across tiles by the
+  pole-aware merge pass in `instances.merge_linear_pieces`.
 * The default backend is geometry-based; Pointcept improves model evidence but the
   competition classes still require the adaptation layer and ideally fine-tuning.
+* Measured extraction accuracy (Quick Simulation ground truth, held-out scenes),
+  the tuning procedure and per-class P/R/F1: see
+  [`docs/ACCURACY_REPORT.md`](ACCURACY_REPORT.md) and
+  [`docs/VALIDATION.md`](VALIDATION.md).
 * `source_point_indices_sample` are tile-local indices (see the tile manifest);
   full per-point provenance is preserved at tile level.
 * GPU inference requires the Pointcept environment; nothing in the default path

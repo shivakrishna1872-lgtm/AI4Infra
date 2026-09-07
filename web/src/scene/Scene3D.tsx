@@ -87,7 +87,8 @@ function makeGeometry(
   for (let i = 0; i < n; i += 1) {
     let c: [number, number, number];
     if (colorMode === "rgb" && rgb && rgb.length === n) {
-      c = [rgb[i][0] / 255, rgb[i][1] / 255, rgb[i][2] / 255];
+      // Backend emits RGB normalized to 0..1 (65535-bit channels / 65535).
+      c = [rgb[i][0], rgb[i][1], rgb[i][2]];
     } else if (colorMode === "intensity" && intensity && intensity.length === n) {
       const t = (intensity[i] - iMin) / (iMax - iMin);
       const v = 0.12 + 0.88 * t;

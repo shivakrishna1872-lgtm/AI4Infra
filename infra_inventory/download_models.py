@@ -8,6 +8,11 @@ a corrupted download never lands in the weights directory. Weights are gitignore
 Available models:
 * ``nuscenes-ptv3-semseg`` - PTv3 nuScenes semantic segmentation (outdoor),
   Pointcept's official release on Hugging Face (model_best.pth + config.py).
+* ``semkitti-minkunet`` / ``semkitti-spvcnn`` / ``semkitti-cylinder3d`` -
+  OpenPCSeg model-zoo checkpoints trained on SemanticKITTI (see
+  configs/model.yaml). Upstream publishes Dropbox links without checksums;
+  the SHA-256 observed at download time is printed and recorded in the
+  manifest so it can be pinned.
 """
 from __future__ import annotations
 
@@ -34,6 +39,51 @@ MODELS: Dict[str, Dict[str, str]] = {
             "nuscenes-semseg-pt-v3m1-0-base/config.py"
         ),
         "config_sha256": None,  # small file; verified by import at runtime
+        "weight_filename": "ptv3_nuscenes_semseg.pth",
+        "config_filename": "ptv3_nuscenes_semseg_config.py",
+    },
+    # --- OpenPCSeg model zoo (SemanticKITTI; upstream README, verified 2026-09) ---
+    "semkitti-minkunet": {
+        "description": "OpenPCSeg MinkowskiNet mk34, SemanticKITTI (mIoU 70.04)",
+        "license": "Apache-2.0 (OpenPCSeg)",
+        "weight_url": (
+            "https://www.dropbox.com/s/a9gjxeziy6rbiui/"
+            "semkitti_minkunet_mk34_cr16_checkpoint_epoch_36.pth?dl=1"
+        ),
+        "weight_sha256": None,  # upstream publishes no checksum; hash is printed
+        "config_url": (
+            "https://raw.githubusercontent.com/BAI-Yeqi/OpenPCSeg/master/"
+            "tools/cfgs/voxel/semantic_kitti/minkunet_mk34_cr10.yaml"
+        ),
+        "config_sha256": None,
+    },
+    "semkitti-spvcnn": {
+        "description": "OpenPCSeg SPVCNN mk18, SemanticKITTI (mIoU 68.58)",
+        "license": "Apache-2.0 (OpenPCSeg)",
+        "weight_url": (
+            "https://www.dropbox.com/s/94j8rxkxlo2j924/"
+            "semkitti_spvcnn_mk18_cr10_checkpoint_epoch_36.pth?dl=1"
+        ),
+        "weight_sha256": None,
+        "config_url": (
+            "https://raw.githubusercontent.com/BAI-Yeqi/OpenPCSeg/master/"
+            "tools/cfgs/fusion/semantic_kitti/spvcnn_mk18_cr10.yaml"
+        ),
+        "config_sha256": None,
+    },
+    "semkitti-cylinder3d": {
+        "description": "OpenPCSeg Cylinder3D cy480, SemanticKITTI (mIoU 66.07)",
+        "license": "Apache-2.0 (OpenPCSeg)",
+        "weight_url": (
+            "https://www.dropbox.com/s/imtcmn9z4qldc2h/"
+            "semkitti_cylinder_cy480_cr10_checkpoint_epoch_35.pth?dl=1"
+        ),
+        "weight_sha256": None,
+        "config_url": (
+            "https://raw.githubusercontent.com/BAI-Yeqi/OpenPCSeg/master/"
+            "tools/cfgs/voxel/semantic_kitti/cylinder_cy480_cr10.yaml"
+        ),
+        "config_sha256": None,
     },
 }
 
@@ -87,15 +137,19 @@ def download_models(output_dir: str | Path = "models", model_key: str = "nuscene
     if model_key not in MODELS:
         raise InfraError(
             f"Unknown model '{model_key}'. Available: {', '.join(sorted(MODELS))}",
-            "Use --model nuscenes-ptv3-semseg (the documented outdoor starting point).",
+            "Use --model <name> (see configs/model.yaml for the documented models).",
         )
     entry = MODELS[model_key]
     print(f"Model: {model_key} - {entry['description']}")
     print(f"License: {entry['license']}")
-    weight_target = output / "ptv3_nuscenes_semseg.pth"
-    config_target = output / "ptv3_nuscenes_semseg_config.py"
+    weight_target = output / entry.get(
+        "weight_filename", f"{model_key}.pth"
+    )
+    config_target = output / entry.get(
+        "config_filename", f"{model_key}_config.yaml"
+    )
     _download(entry["weight_url"], weight_target, entry["weight_sha256"], "model weights")
-    _download(entry["config_url"], config_target, "", "model config")
+    _download(entry["config_url"], config_target, entry.get("config_sha256"), "model config")
     manifest = {
         "model": model_key,
         "description": entry["description"],
@@ -103,7 +157,7 @@ def download_models(output_dir: str | Path = "models", model_key: str = "nuscene
         "config": str(config_target),
         "source": entry["weight_url"].split("/resolve/")[0],
         "license": entry["license"],
-        "sha256": entry["weight_sha256"],
+        "sha256": entry["weight_sha256"] or _sha256(weight_target),
     }
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print(f"Done. Manifest: {output / 'manifest.json'}")

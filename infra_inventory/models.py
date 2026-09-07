@@ -76,6 +76,13 @@ class Asset:
     geometry: Optional[Dict[str, Any]] = None
     qc_flags: List[str] = field(default_factory=list)
     flagged: bool = False
+    # ALP assessment layer (Observation -> Interpretation -> Recommended Action).
+    # Derived only from measured signals + confidence + QC flags; never guesses
+    # an unmeasured cause. review_required routes the asset to human review.
+    condition: Optional[str] = None          # GOOD | FAIR | POOR | REVIEW
+    recommended_action: Optional[str] = None
+    review_required: bool = False
+    assessment_reasoning: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
@@ -94,7 +101,15 @@ class ProcessingSettings:
     chunk_size: int = 500_000
     tile_size_m: float = 40.0
     tile_overlap_m: float = 0.0  # 0 = non-overlapping tiles; instances on boundaries are QC-deduped
-    viewer_point_limit: int = 250_000
+    # Decimated overview points for the browser: 120k points is plenty for a
+    # digital-twin overview and keeps the JSON payload small enough to load
+    # instantly. Full-resolution data is never sent to the browser.
+    viewer_point_limit: int = 120_000
+    # Hard cap on viewer-data.json bytes. The browser payload is a LOD overview
+    # (voxel-downsampled cloud + slim asset records); if it would still exceed
+    # this, the background cloud is thinned further so "Loading viewer data"
+    # never blocks on multi-gigabyte inputs.
+    viewer_payload_max_bytes: int = 9_000_000
     point_index_sample_limit: int = 256
     save_tiles: bool = True
     # Uniform input thinning (LAStools las2las -thin analogue): when > 0 and the
@@ -102,14 +117,35 @@ class ProcessingSettings:
     # very large files (e.g. airborne 3DEP tiles) process with bounded memory.
     # 0 = process every point (recommended for mobile competition data).
     max_input_points: int = 0
+    # Confidence below this routes an asset to human review instead of trusting
+    # it downstream. Default 0.80 was measured by the calibration sweep in
+    # scripts/calibrate_confidence.py (compact-object precision 1.00 / recall
+    # 0.89 at this cut on the 400 m simulated ground truth), never intuition
+    # (docs/ALP.md).
+    review_confidence_threshold: float = 0.8
 
     # --- Backends ---
-    backend: str = "geometry"  # "geometry" | "pointcept"
+    # "geometry" (CPU, default) | "pointcept" (PTv3 prior) | "gemini" (LLM
+    # class-validation booster; requires GEMINI_API_KEY)
+    backend: str = "geometry"
+    gemini_model: str = "gemini-3.6-flash"
+    # Explicit key override (testing / per-run CLI use). None reads GEMINI_API_KEY.
+    gemini_api_key: Optional[str] = None
     pointcept_root: Optional[str] = None
     pointcept_config: Optional[str] = None
     pointcept_weight: Optional[str] = None
     pointcept_class_names: Optional[str] = None  # JSON list, aligned with the config's taxonomy
     pointcept_num_gpus: int = 1
+    # OpenPCSeg learned backend (MinkowskiNet/SPVCNN/Cylinder3D; Toronto-3D
+    # fine-tuning). Requires a checkout with infer.py/train.py and a GPU.
+    openpcseg_root: Optional[str] = None
+    openpcseg_config: Optional[str] = None  # OpenPCSeg .yaml (tools/cfgs/...)
+    openpcseg_weight: Optional[str] = None  # checkpoint .pth
+    # Which documented upstream taxonomy -> asset mapping applies (checkpoint's
+    # training set): "toronto3d" (fine-tuned, 9 ids) or "semantickitti"
+    # (pretrained model-zoo weights, 20 ids).
+    openpcseg_taxonomy: str = "toronto3d"
+    openpcseg_num_gpus: int = 1
     roadmarking_command: Optional[str] = None
     roadmarking_config: Optional[str] = None
 
@@ -141,10 +177,15 @@ class ProcessingSettings:
     pole_min_points: int = 40
     pole_resolution_m: float = 0.45
     conductor_min_height_m: float = 4.0
-    conductor_min_length_m: float = 8.0
+    conductor_min_length_m: float = 5.0
     conductor_max_width_m: float = 0.6
     conductor_max_height_extent_m: float = 3.5  # tolerant of pole-attached wires
-    conductor_min_points: int = 60
+    # Wires arrive as short per-tile pieces: 2-D tiles cut a 60 m span at every
+    # boundary into slivers (a ~28 m-wide corridor crossing the y=0 band edge
+    # leaves 5-12 m slivers), and mobile occlusion drops add more. Precision is
+    # held by the cross-section / linearity / height-extent gates, so the
+    # per-tile minimums stay low and the merge pass reconstructs full spans.
+    conductor_min_points: int = 15
     conductor_resolution_m: float = 0.5
     cabinet_min_height_m: float = 0.4
     cabinet_max_height_m: float = 3.0
