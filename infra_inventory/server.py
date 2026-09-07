@@ -38,6 +38,7 @@ from .models import ProcessingSettings
 from .pipeline import process_las
 from .simulation import run_quick_simulation, run_data_simulation, run_small_synthetic
 from . import upload_store
+from .tile_space import build_tile_space
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "appdata"
 
@@ -210,6 +211,11 @@ class ProcessRequest(BaseModel):
     #: "auto" (default) uses Gemini validation when GEMINI_API_KEY is set;
     #: True/False force it on/off regardless of the environment.
     use_gemini: Optional[str] = None
+    #: Build/update the tile-space streaming package for this project after
+    #: processing. Kept as an explicit opt-in so the default web run stays
+    #: lean (tile intermediates are dropped; tile-space rebuild adds the
+    #: overview + manifest + tile copy under <project>/tile-space/).
+    build_tile_space: Optional[bool] = None
 
 
 def _web_settings(
@@ -276,6 +282,9 @@ def _project_info(meta: dict) -> ProjectInfo:
             info.asset_count = len(json.loads(assets_path.read_text(encoding="utf-8")))
         info.summary = meta
     info.scene = meta.get("scene")
+    if meta.get("tile_space"):
+        info.scene = info.scene or {}
+        info.scene["tile_space"] = meta["tile_space"]
     return info
 
 
@@ -481,6 +490,39 @@ def complete_upload(project_id: str, upload_id: str, request: CompleteUploadRequ
     return info
 
 
+@app.post("/api/projects/{project_id}/tile-space")
+def build_tile_space_for_project(project_id: str) -> dict:
+    _ensure_disk_headroom()
+    meta = _read_project(project_id)
+    project_dir = _project_dir(project_id)
+    tiles_dir = project_dir / "output" / "tiles"
+    if not tiles_dir.is_dir():
+        raise HTTPException(
+            status_code=400,
+            detail="No tiles found for this project — process a LAS file first",
+        )
+    target = project_dir / "tile-space"
+    if target.exists():
+        shutil.rmtree(target, ignore_errors=True)
+    try:
+        summary = build_tile_space(
+            tiles_dir,
+            target,
+            settings=ProcessingSettings(),
+            progress=False,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Tile-space build failed: {exc}")
+    meta["tile_space"] = summary["output"]
+    _save_project(project_id, meta)
+    return {
+        "tile_space": summary["output"],
+        "tiles": summary["tiles"],
+        "overview_points": summary["overview_points"],
+        "bounds": summary["bounds"],
+    }
+
+
 @app.delete("/api/projects/{project_id}/uploads/{upload_id}")
 def abort_upload_session(project_id: str, upload_id: str) -> dict:
     try:
@@ -569,7 +611,9 @@ async def storage_event_webhook(request: Request) -> dict:
     return {"matched": len(matched), "ingested": matched, "ignored": ignored}
 
 
-def _run_job(project_id: str, job_id: str, settings: ProcessingSettings) -> None:
+def _run_job(
+    project_id: str, job_id: str, settings: ProcessingSettings, build_tile_space: bool = False
+) -> None:
     directory = _project_dir(project_id)
     output = directory / "output"
     input_path = directory / "input.las"
@@ -594,6 +638,21 @@ def _run_job(project_id: str, job_id: str, settings: ProcessingSettings) -> None
             progress=False,
             progress_callback=report,
         )
+        if build_tile_space and (output / "tiles").is_dir():
+            report({"stage": "tile-space", "message": "Building streaming tile package"})
+            try:
+                tsp = build_tile_space(
+                    output / "tiles", output / "tile-space",
+                    settings=settings, progress=False,
+                )
+                meta = _read_project(project_id)
+                meta["tile_space"] = tsp["output"]
+                _save_project(project_id, meta)
+                with _JOBS_LOCK:
+                    _JOBS[job_id]["tile_space"] = tsp["output"]
+            except Exception as exc:
+                report({"stage": "error", "message": f"Tile-space build failed: {exc}"})
+                return
         with _JOBS_LOCK:
             _JOBS[job_id].update({
                 "stage": "done",
@@ -635,6 +694,7 @@ def start_process(project_id: str, request: ProcessRequest) -> dict:
         settings.tile_size_m = request.tile_size_m
     if request.viewer_point_limit:
         settings.viewer_point_limit = request.viewer_point_limit
+    build_tile_space = request.build_tile_space not in (None, False, "false", "0", "off")
     # Refuse to run two jobs on the same project: the second run rmtree's the
     # first one's output dir out from under it, orphaning a zombie thread that
     # spins forever on missing tiles and steals CPU from real jobs.
@@ -660,7 +720,11 @@ def start_process(project_id: str, request: ProcessRequest) -> dict:
             "started_at": time.time(),
         }
     _write_job(_JOBS[job_id])
-    thread = threading.Thread(target=_run_job, args=(project_id, job_id, settings), daemon=True)
+    thread = threading.Thread(
+        target=_run_job,
+        args=(project_id, job_id, settings, build_tile_space),
+        daemon=True,
+    )
     thread.start()
     return {"job_id": job_id}
 
@@ -798,11 +862,55 @@ def export_file(project_id: str, name: str):
     path = output / name
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Export not available yet")
-    media = {
-        "assets.csv": "text/csv",
-        "assets.geojson": "application/geo+json",
+    media = {    "assets.csv": "text/csv",
+    "assets.geojson": "application/geo+json",
     }.get(name, "application/json")
     return FileResponse(path, media_type=media, filename=name)
+
+
+@app.get("/api/projects/{project_id}/tile-space/manifest")
+def tile_space_manifest(project_id: str):
+    project_dir = _project_dir(project_id)
+    manifest = project_dir / "tile-space" / "manifest.json"
+    if not manifest.is_file():
+        raise HTTPException(status_code=404, detail="No tile-space package for this project")
+    return FileResponse(manifest, media_type="application/json")
+
+
+@app.get("/api/projects/{project_id}/tile-space/overview")
+def tile_space_overview(project_id: str):
+    project_dir = _project_dir(project_id)
+    overview = project_dir / "tile-space" / "overview.las"
+    if not overview.is_file():
+        raise HTTPException(status_code=404, detail="No tile-space overview for this project")
+    return FileResponse(overview, media_type="application/octet-stream", filename="overview.las")
+
+
+@app.get("/api/projects/{project_id}/tile-space/tiles/{tx}-{ty}.las")
+def tile_space_tile(project_id: str, tx: int, ty: int):
+    project_dir = _project_dir(project_id)
+    tile = project_dir / "tile-space" / f"tile-{tx}-{ty}.las"
+    if not tile.is_file():
+        raise HTTPException(status_code=404, detail="Tile not found")
+    return FileResponse(tile, media_type="application/octet-stream")
+
+
+@app.get("/api/projects/{project_id}/tile-space/viewer")
+def tile_space_viewer_index(project_id: str):
+    project_dir = _project_dir(project_id)
+    viewer = project_dir / "tile-space" / "viewer" / "index.html"
+    if not viewer.is_file():
+        raise HTTPException(status_code=404, detail="No tile-space viewer")
+    return FileResponse(viewer, media_type="text/html")
+
+
+@app.get("/api/projects/{project_id}/tile-space/viewer-data")
+def tile_space_viewer_data(project_id: str):
+    project_dir = _project_dir(project_id)
+    data = project_dir / "tile-space" / "viewer" / "viewer-data.json"
+    if not data.is_file():
+        raise HTTPException(status_code=404, detail="No tile-space viewer data")
+    return FileResponse(data, media_type="application/json")
 
 
 @app.post("/api/simulate", response_model=ProjectInfo)
@@ -856,6 +964,7 @@ def simulate() -> ProjectInfo:
         "scene": project.get("scene_summary", {}),
         "simulation_note": "SIMULATION / DEMO DATA - not real competition data",
         "simulation_meta": project.get("simulation_meta"),
+        "tile_size_m": project.get("tile_size_m", ProcessingSettings().tile_size_m),
     }
     _save_project(project_id, meta)
     return _project_info(meta)

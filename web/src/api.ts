@@ -255,6 +255,30 @@ export const api = {
   viewerData: (projectId: string) =>
     request<ViewerData>(`/api/projects/${projectId}/viewer-data`, undefined, 180000),
 
+  /** Fetch the streaming tile-space package for a project.
+   * Returns the tile-space viewer payload (manifest + overview + tile index)
+   * when the project has had its tile-space package built via POST
+   * /api/projects/{id}/tile-space. Falls back to /api/projects/{id}/viewer-data
+   * if the package has not yet been built.
+   */
+  tileSpaceViewerData: (projectId: string) =>
+    request<ViewerData>(
+      `/api/projects/${projectId}/tile-space/viewer-data`,
+      undefined,
+      180000
+    ),
+
+  /** Build or rebuild the tile-space streaming package for a processed project.
+   * The backend runs the existing spatial tiling and produces a manifest,
+   * a voxel-downsampled overview LAS, per-tile LAS files, and a viewer payload
+   * the frontend can lazy-load from (range-request / overview streaming).
+   */
+  buildTileSpace: (projectId: string) =>
+    request<{ tile_space: string; tiles: number; overview_points: number; bounds: number[] }>(
+      `/api/projects/${projectId}/tile-space`,
+      { method: "POST" }
+    ),
+
   simulate: () => request<Project>("/api/simulate", { method: "POST" }),
 
   simulateData: (file: File) => {

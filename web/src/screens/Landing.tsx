@@ -566,6 +566,7 @@ export default function Landing({ onOpen }: Props) {
                 {p.input_file ? ` · ${p.input_file}` : ""}
                 {p.point_count ? ` · ${p.point_count.toLocaleString()} pts` : ""}
                 {p.asset_count != null ? ` · ${p.asset_count} assets` : ""}
+                {p.scene?.tile_space ? " · tiled" : ""}
                 {p.processed ? " · processed" : " · pending"}
               </div>
             </div>

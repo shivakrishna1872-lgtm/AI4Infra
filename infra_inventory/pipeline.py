@@ -45,6 +45,7 @@ from .qc import run_quality_control
 from .roadmarking import run_roadmarking
 from .validation import validate_las
 from .viewer import write_viewer
+from .tile_space import build_tile_space
 
 VERSION = "0.3.0"
 

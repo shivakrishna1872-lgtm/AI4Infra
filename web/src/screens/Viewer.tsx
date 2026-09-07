@@ -43,24 +43,46 @@ export default function Viewer({ project, onBack }: Props) {
   const [dragging, setDragging] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);
   const [loadKey, setLoadKey] = useState(0);
+  const [tileSpaceLoading, setTileSpaceLoading] = useState(false);
+  const [tileSpaceBuilt, setTileSpaceBuilt] = useState(!!project.scene?.tile_space);
 
   useEffect(() => {
-    let cancelled = false;
+    // If the project already has a streaming tile-space package, load that
+    // instead of the pipeline run payload (overview + manifest + tile index).
+    if (project.scene?.tile_space) {
+      let cancelled = false;
+      setLoadError(null);
+      api
+        .tileSpaceViewerData(project.id)
+        .then((d) => {
+          if (cancelled) return;
+          setData(d);
+          setVisibleClasses(new Set((d.assets || []).map((a) => a.class)));
+        })
+        .catch((err) => {
+          if (!cancelled) setLoadError(err instanceof Error ? err.message : String(err));
+        });
+      return () => {
+        cancelled = true;
+      };
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project.id, project.scene?.tile_space, loadKey]);
+
+  const buildTileSpace = useCallback(async () => {
+    if (!project.id) return;
+    setTileSpaceLoading(true);
     setLoadError(null);
-    api
-      .viewerData(project.id)
-      .then((d) => {
-        if (cancelled) return;
-        setData(d);
-        setVisibleClasses(new Set(d.assets.map((a) => a.class)));
-      })
-      .catch((err) => {
-        if (!cancelled) setLoadError(err instanceof Error ? err.message : String(err));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [project.id, loadKey]);
+    try {
+      await api.buildTileSpace(project.id);
+      setTileSpaceBuilt(true);
+      setLoadKey((k) => k + 1);
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setTileSpaceLoading(false);
+    }
+  }, [project.id]);
 
   const hasRgb = !!(data && data.point_rgb && data.point_rgb.length > 0);
   const hasClass = !!(data && data.point_class && data.point_class.length > 0);
@@ -246,6 +268,20 @@ export default function Viewer({ project, onBack }: Props) {
         <button className={`tbtn ${showLabels ? "on" : ""}`} onClick={() => setShowLabels((s) => !s)}>Labels</button>
         <button className={`tbtn ${showGrid ? "on" : ""}`} onClick={() => setShowGrid((s) => !s)}>Grid</button>
         <button className={`tbtn ${showBBoxes ? "on" : ""}`} onClick={() => setShowBBoxes((s) => !s)}>BBox</button>
+
+        {!tileSpaceBuilt && !tileSpaceLoading && (
+          <button
+            className="tbtn"
+            onClick={buildTileSpace}
+            disabled={!project.processed}
+            title="Build streaming tile-space package (overview + tile index)"
+          >
+            Tile Space
+          </button>
+        )}
+        {tileSpaceLoading && (
+          <span className="tag" style={{ color: "var(--text-faint)" }}>tiling…</span>
+        )}
 
         <div className="spacer" />
 

@@ -43,7 +43,11 @@ def test_simulate_process_viewer_export_roundtrip(client):
     assert project["input_file"].endswith(".las")
 
     # 2. process it as a background job
-    response = client.post(f"/api/projects/{project['id']}/process", json={})
+    response = client.post(
+        f"/api/projects/{project['id']}/process",
+        content=b"{}",
+        headers={"content-type": "application/json"},
+    )
     assert response.status_code == 200
     job_id = response.json()["job_id"]
 
@@ -106,7 +110,11 @@ def test_upload_rejects_non_las(client):
 
 def test_process_requires_upload(client):
     project = client.post("/api/projects", params={"name": "empty"}).json()
-    response = client.post(f"/api/projects/{project['id']}/process", json={})
+    response = client.post(
+        f"/api/projects/{project['id']}/process",
+        content=b"{}",
+        headers={"content-type": "application/json"},
+    )
     assert response.status_code == 400
     client.delete(f"/api/projects/{project['id']}")
 
@@ -167,7 +175,11 @@ def test_processing_preflight_returns_clear_507_when_disk_full(client, monkeypat
     instead of crashing mid-write with Errno 28."""
     monkeypatch.setattr(server, "_free_disk_bytes", lambda: server.MIN_FREE_DISK_BYTES - 1)
     project = client.post("/api/projects", params={"name": "diskfull"}).json()
-    response = client.post(f"/api/projects/{project['id']}/process", json={})
+    response = client.post(
+        f"/api/projects/{project['id']}/process",
+        content=b"{}",
+        headers={"content-type": "application/json"},
+    )
     assert response.status_code == 507
     assert "disk" in response.json()["detail"].lower()
     # Quick Simulation is preflighted too
@@ -188,7 +200,11 @@ def test_web_job_does_not_keep_tile_intermediates(client, tmp_path):
             files={"file": ("input.las", handle, "application/octet-stream")},
         )
     assert upload.status_code == 200
-    started = client.post(f"/api/projects/{project['id']}/process", json={}).json()
+    started = client.post(
+        f"/api/projects/{project['id']}/process",
+        content=b"{}",
+        headers={"content-type": "application/json"},
+    ).json()
     status = wait_done(client, started["job_id"])
     assert status["stage"] == "done"
     output_dir = server._project_dir(project["id"]) / "output"
@@ -236,7 +252,11 @@ def test_viewer_data_served_gzip_compressed(client, tmp_path):
             f"/api/projects/{project['id']}/upload",
             files={"file": ("input.las", handle, "application/octet-stream")},
         )
-    started = client.post(f"/api/projects/{project['id']}/process", json={}).json()
+    started = client.post(
+        f"/api/projects/{project['id']}/process",
+        content=b"{}",
+        headers={"content-type": "application/json"},
+    ).json()
     status = wait_done(client, started["job_id"])
     assert status["stage"] == "done"
 
@@ -278,14 +298,22 @@ def test_second_process_on_same_project_is_rejected(client, tmp_path, monkeypatc
     monkeypatch.setattr(server, "process_las", slow)
     first = client.post(f"/api/projects/{project['id']}/process", json={})
     assert first.status_code == 200
-    second = client.post(f"/api/projects/{project['id']}/process", json={})
+    second = client.post(
+        f"/api/projects/{project['id']}/process",
+        content=b"{}",
+        headers={"content-type": "application/json"},
+    )
     assert second.status_code == 409
     assert "already being processed" in second.json()["detail"]
     status = wait_done(client, first.json()["job_id"])
     assert status["stage"] == "done"
     # After completion the project can be processed again.
     monkeypatch.setattr(server, "process_las", original)
-    again = client.post(f"/api/projects/{project['id']}/process", json={})
+    again = client.post(
+        f"/api/projects/{project['id']}/process",
+        content=b"{}",
+        headers={"content-type": "application/json"},
+    )
     assert again.status_code == 200
     assert wait_done(client, again.json()["job_id"])["stage"] == "done"
 
@@ -321,7 +349,11 @@ def test_process_endpoint_accepts_use_gemini_flag(client, tmp_path, monkeypatch)
     with src.open("rb") as handle:
         up = client.post(f"/api/projects/{project['id']}/upload", files={"file": ("in.las", handle, "application/octet-stream")})
     assert up.status_code == 200
-    start = client.post(f"/api/projects/{project['id']}/process", json={"use_gemini": "false"})
+    start = client.post(
+        f"/api/projects/{project['id']}/process",
+        content=b'{"use_gemini": "false"}',
+        headers={"content-type": "application/json"},
+    )
     assert start.status_code == 200
     status = wait_done(client, start.json()["job_id"])
     assert status["stage"] == "done"

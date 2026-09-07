@@ -13,12 +13,58 @@ engine (no CDN, no libraries). Features:
 """
 from __future__ import annotations
 
+import math
+from typing import List
+
+import numpy as np
 from pathlib import Path
+
+
+_STOPS = ((0.06, 0.16, 0.38), (0.10, 0.45, 0.55), (0.95, 0.80, 0.42))
+
+
+def elevation_color(z01: np.ndarray) -> List[List[float]]:
+    """Viewer point colors: elevation gradient (deep blue -> teal -> amber)."""
+    colors = []
+    for value in z01.tolist():
+        t = max(0.0, min(1.0, value))
+        if t < 0.5:
+            local = t / 0.5
+            a, b = _STOPS[0], _STOPS[1]
+        else:
+            local = (t - 0.5) / 0.5
+            a, b = _STOPS[1], _STOPS[2]
+        colors.append([round(a[i] + (b[i] - a[i]) * local, 4) for i in range(3)])
+    return colors
 
 
 def write_viewer(viewer_dir: Path) -> None:
     viewer_dir.mkdir(parents=True, exist_ok=True)
     (viewer_dir / "index.html").write_text(_HTML, encoding="utf-8")
+
+
+def write_viewer_data(viewer_dir: Path, points, colors, point_intensity, point_rgb, assets, run_summary, tile_count) -> dict:
+    """Write the viewer-data.json the embedded viewer expects, plus return the payload."""
+    import json
+
+    viewer_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "points": points,
+        "point_colors": colors,
+        "point_rgb": point_rgb,
+        "point_intensity": point_intensity,
+        "assets": [a.to_dict() if hasattr(a, "to_dict") else a for a in assets],
+        "run": {
+            "point_count": run_summary.point_count,
+            "bounds": list(run_summary.bounds),
+            "crs": run_summary.crs,
+            "las_version": run_summary.las_version,
+            "tile_count": tile_count,
+            "backend": run_summary.backend,
+        },
+    }
+    (viewer_dir / "viewer-data.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return payload
 
 
 _HTML = """<!doctype html>

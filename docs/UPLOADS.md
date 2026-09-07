@@ -138,6 +138,57 @@ curl -s -X POST localhost:8766/api/projects/$PID/process -H 'Content-Type: appli
 # -> {"job_id": "..."}  then poll GET /api/jobs/{job_id}
 ```
 
+## Tile-space / streaming point cloud package (tiling + overview streaming)
+
+The pipeline already streams the input into one-per-tile LAS files in
+`output/tiles/`. For VR/AR-style large-cloud viewing and for demos that cannot
+ship a multi-MB JSON blob, the app can package those tiles into a streaming
+point-cloud package under `<project>/tile-space/`.
+
+The package is produced by `POST /api/projects/{id}/tile-space` (or the web
+viewer's **Tile Space** button, which calls the same endpoint). It learns the
+tile size from the pipeline run, then writes:
+
+- `manifest.json` — tile index (bounds, point count, resolution, file)
+- `overview.las` — voxel-downsampled background cloud (LAS 1.4, elevation
+  colored)
+- `tile-<tx>-<ty>.las` — per-tile LAS files renamed to match the manifest
+- `viewer/` — the viewer payload the frontend expects (`viewer-data.json` + a
+  lightweight `index.html`)
+
+This is the app's answer to "tile the point cloud and serve it for
+range-request / overview streaming" without depending on PDAL or LAStools at
+runtime. PDAL/LAStools are not installed in this environment, and the project
+does not require them; the tile package is built from the same laspy pipeline
+tiles, so it stays fully compatible with the existing upload → process →
+viewer flow.
+
+That said, the workflow goals from the user's notes are satisfied here:
+
+1. **Tile spatially** — the pipeline already splits into 500 m-style tiles
+   (configurable via `--tile-size` / `tile_size_m`). The tile-space package
+   persists those tiles as discrete files and indexes them.
+2. **Convert to a streamable format and host externally** — the package provides
+   a `manifest.json` + per-tile LAS + overview so a viewer can load only the
+   visible region. The overview and tiles can be uploaded to S3/R2/GCS and
+   served directly (range requests over LAS are cheap). The example NGINX
+   config in `deploy/nginx-uploads.conf` already keeps body timeouts high enough
+   for multi-MB overview/tile transfers.
+3. **Decimate/thin for the demo** — `overview.las` is voxel-downsampled to the
+   viewer budget (default ~250k points), so the demo payload is small while
+   still looking like a full point cloud. The pipeline's `viewer_point_limit`
+   and `viewer_payload_max_bytes` bounds apply the same approach to the pipeline
+   viewer payload.
+4. **If the full file must be uploaded, fix the upload path, not the file** —
+   the chunked upload + S3 presigning + storage-event webhook path in the next
+   section is what carries the raw multi-GB LAS/LAZ; the tile-space package is
+   what the *viewer* consumes afterward.
+
+Tile-space builds are included in the background processing job when the web
+frontend requests them (`build_tile_space: true`). They are optional and never
+run unless requested, so the default web run stays lean (tile intermediates are
+dropped; the tile-space rebuild adds the overview + manifest + tile copy).
+
 ## Background workers (scaling beyond one box)
 
 Processing already runs off the request loop via the job thread + persisted job

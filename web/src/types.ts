@@ -63,6 +63,30 @@ export interface ViewerData {
   point_intensity?: number[];
   point_class?: number[];
   point_class_names?: string[];
+  /** When the viewer loaded from a streaming tile-space package rather than a pipeline run. */
+  tile_space?: boolean;
+  /** Tile index for lazy tile loading in a future viewer update. */
+  manifest?: {
+    version: string;
+    tile_size_m: number;
+    bounds: number[];
+    overview: {
+      point_count: number;
+      bounds: number[];
+      file: string;
+      color_mode: string;
+    };
+    tiles: {
+      file: string;
+      tx: number;
+      ty: number;
+      point_count: number;
+      bounds: number[];
+      resolution_m: number;
+    }[];
+    tile_file_prefix: string;
+  };
+  overview_point_count?: number;
 }
 
 export interface Project {
@@ -79,6 +103,10 @@ export interface Project {
   point_format: number | null;
   asset_count: number | null;
   summary: Record<string, unknown> | null;
+  /** When the streaming tile-space package has been built for this project. */
+  scene?: {
+    tile_space?: string;
+  } | null;
 }
 
 export interface JobStatus {
