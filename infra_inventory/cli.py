@@ -312,6 +312,19 @@ def _simulate(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _export_geojson(args: argparse.Namespace) -> int:
+    from .export_geojson import _write_geojson
+
+    assets_path = Path(args.assets).expanduser().resolve()
+    out_path = Path(args.output).expanduser().resolve()
+    if not assets_path.is_file():
+        print(f"assets.json not found: {assets_path}", file=sys.stderr)
+        return EXIT_USER
+    collection = _write_geojson(assets_path, out_path)
+    print(f"wrote {len(collection['features'])} features -> {out_path}")
+    return EXIT_OK
+
+
 def _app(args: argparse.Namespace) -> int:
     from .server import main as server_main
 
@@ -415,6 +428,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     app_parser = subparsers.add_parser("app", help="Run the FastAPI inspection platform (pip install -e '.[server]')")
     app_parser.set_defaults(func=_app)
+
+    export_geojson = subparsers.add_parser(
+        "export-geojson",
+        help="Convert assets.json -> a proper GeoJSON FeatureCollection (Point per asset, GIS-ready)",
+    )
+    export_geojson.add_argument("assets", help="assets.json produced by `process`")
+    export_geojson.add_argument("output", help="Output .geojson file")
+    export_geojson.set_defaults(func=_export_geojson)
     return parser
 
 
