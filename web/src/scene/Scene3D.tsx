@@ -619,7 +619,7 @@ export default function Scene3D(props: Scene3DProps) {
         if (!measuring) onSelect(null);
       }}
     >
-      <color attach="background" args={["#07090d"]} />
+      <color attach="background" args={["#211a12"]} />
       <fog attach="fog" args={["#07090d", diag * 0.85, diag * 2.4]} />
       <ambientLight intensity={0.55} />
       <directionalLight position={[diag * 0.4, diag * 0.9, diag * 0.3]} intensity={1.1} />

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 import numpy as np
 
@@ -55,6 +55,167 @@ class ValidationResult:
         if self.errors:
             first = self.errors[0]
             raise RuntimeError(f"{first.message} Suggested fix: {first.hint}")
+
+
+# ---------------------------------------------------------------------------
+# Bounded LAS header sanity check (upload gate)
+# ---------------------------------------------------------------------------
+#
+# laspy.open() can spin forever on a text-mangled / truncated file: it loops
+# `for _ in range(number_of_vlrs / number_of_evlrs)` reading from the stream,
+# and once the stream is at EOF every read returns b"" with zero-length
+# payloads, so the loop never terminates. A corrupt upload must therefore be
+# rejected with hard structural bounds BEFORE laspy ever opens the file.
+# Every check below is O(1) per header field and O(vlr-count) total (bounded
+# by file size / minimum record size), so a hostile file cannot stall it.
+
+_VLR_HEADER_BYTES = 54  # 2 reserved + 16 user_id + 2 record_id + 2 len + 32 desc
+_EVLR_HEADER_BYTES = 60  # 2 reserved + 16 user_id + 2 record_id + 8 len + 32 desc
+_MAX_VLRS = 100_000
+_MAX_EVLRS = 1_000_000
+
+
+def _u16(data: bytes, offset: int) -> int:
+    return int.from_bytes(data[offset : offset + 2], "little")
+
+
+def _u32(data: bytes, offset: int) -> int:
+    return int.from_bytes(data[offset : offset + 4], "little")
+
+
+def _u64(data: bytes, offset: int) -> int:
+    return int.from_bytes(data[offset : offset + 8], "little")
+
+
+def check_las_header_bounded(path: str | Path) -> Tuple[bool, str]:
+    """Structurally validate a LAS header without trusting any count field.
+
+    Returns ``(ok, reason)``. When ``ok`` is False, ``reason`` explains why
+    the file cannot be a valid LAS (mangled header, truncated body, or
+    unbounded VLR/EVLR counts). Cheap enough to run on every upload.
+    """
+    path = Path(path)
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return False, f"cannot stat file: {exc}"
+    if size < 227:
+        return False, f"file is only {size} bytes (a LAS header alone is 227+)"
+    with path.open("rb") as handle:
+        head = handle.read(435)  # 375-byte LAS 1.4 header + EVLR fields
+    if len(head) < 227:
+        return False, "file too short to hold a LAS header"
+    if head[:4] != b"LASF":
+        return False, "missing the LASF file signature (not a LAS file)"
+
+    major, minor = head[24], head[25]
+    if major == 1 and minor > 4:
+        return False, f"unsupported LAS version 1.{minor}"
+    if major == 2 and minor > 4:
+        return False, f"unsupported LAS version 2.{minor}"
+    if major not in (1, 2):
+        return False, f"unrecognized LAS major version {major}"
+
+    header_size = _u16(head, 94)
+    if not 227 <= header_size <= 375:
+        return False, f"header size {header_size} is outside the valid 227..375 range"
+    # NOTE: parse the layout exactly the way laspy does, or the gate will
+    # reject files laspy reads fine (and vice versa). laspy reads the offset
+    # as a u32 at byte 96 and the VLR count as a u32 at byte 100 — a Trimble
+    # MX9 export carries its real (small) offset and VLR count in those
+    # legacy fields even though header_size is 375. Reading them as a u64
+    # collides num_vlrs into the offset's high bytes and looks "huge".
+    offset = _u32(head, 96)
+    num_vlrs = _u32(head, 100)
+    if num_vlrs > _MAX_VLRS:
+        return False, f"{num_vlrs} VLRs declared — implausible (max {_MAX_VLRS})"
+
+    # Walk the VLR table the way laspy does: each VLR is a 54-byte header
+    # FOLLOWED BY ITS PAYLOAD, so headers are not contiguous. A laszip VLR
+    # ("laszip encoded") marks a LAZ file, whose point-data offset and point
+    # counts are sentinels/unset by design — those checks only apply to
+    # uncompressed LAS. The walk is bounded: every VLR advances at least 54
+    # bytes and the table is capped at 64 MiB (real files use < a few MiB).
+    is_laz = False
+    pos = header_size
+    with path.open("rb") as handle:
+        for _ in range(num_vlrs):
+            if pos + _VLR_HEADER_BYTES > size:
+                return False, "VLR table truncated — corrupted file"
+            if pos - header_size > 64 * 1024 * 1024:
+                return False, "VLR table implausibly large — corrupted header"
+            handle.seek(pos)
+            vlr_head = handle.read(_VLR_HEADER_BYTES)
+            if len(vlr_head) < _VLR_HEADER_BYTES:
+                return False, "VLR table truncated — corrupted file"
+            if vlr_head[2:18].rstrip(b"\0") == b"laszip encoded":
+                is_laz = True
+            payload = _u16(vlr_head, 20)
+            pos += _VLR_HEADER_BYTES + payload
+    if pos > size:
+        return False, "VLR table exceeds the file size — corrupted file"
+
+    if not is_laz:
+        # Uncompressed LAS: the offset must be a real position inside the file
+        # and the VLR table must end before it.
+        if offset < header_size:
+            return False, f"point-data offset {offset} is before the header end ({header_size})"
+        if offset > size:
+            return False, f"point-data offset {offset} exceeds the file size ({size}) — truncated or mangled header"
+        if pos > offset:
+            return False, "VLR table overruns the point-data offset — corrupted header"
+
+    point_format = head[104]
+    if is_laz:
+        # laszip writers set the high bit (0x80) as a compressed-data flag on
+        # the format byte; laspy masks it before interpreting the format.
+        point_format &= 0x7F
+    if point_format > 10:
+        return False, f"point data record format {point_format} is invalid (0..10)"
+    record_length = _u16(head, 105)
+    if not 20 <= record_length <= 1024:
+        return False, f"point data record length {record_length} is outside 20..1024"
+
+    if not is_laz:
+        # laspy reads the u64 point count at byte 247 for minor >= 4 (the
+        # legacy u32 at 107 is 0 on such files), else the u32 at 107.
+        if minor >= 4:
+            count = _u64(head, 247)
+        else:
+            count = _u32(head, 107)
+        if count and offset + count * record_length > size + record_length:
+            return False, (
+                f"header declares {count} points × {record_length}-byte records = "
+                f"{offset + count * record_length} bytes, but the file is only {size} "
+                "bytes — truncated or mangled file"
+            )
+
+    if not is_laz and minor >= 4:
+        # laspy-compatible offsets: waveform record at 227, start of first
+        # EVLR at 235, number of EVLRs at 243.
+        num_evlrs = _u32(head, 243)
+        start_evlr = _u64(head, 235)
+        if num_evlrs:
+            if num_evlrs > _MAX_EVLRS:
+                return False, f"{num_evlrs} EVLRs declared — implausible (max {_MAX_EVLRS})"
+            if start_evlr < offset:
+                return False, "EVLR start precedes the point data — corrupted header"
+            if start_evlr > size or start_evlr + num_evlrs * _EVLR_HEADER_BYTES > size:
+                return False, "EVLR table exceeds the file size — corrupted header"
+            pos = start_evlr
+            for _ in range(num_evlrs):
+                if pos + _EVLR_HEADER_BYTES > size:
+                    return False, "EVLR table overruns the file size — corrupted header"
+                with path.open("rb") as handle:
+                    handle.seek(pos)
+                    evlr_head = handle.read(_EVLR_HEADER_BYTES)
+                if len(evlr_head) < _EVLR_HEADER_BYTES:
+                    return False, "EVLR header truncated — corrupted file"
+                payload = _u64(evlr_head, 20)
+                if pos + _EVLR_HEADER_BYTES + payload > size:
+                    return False, "an EVLR payload overruns the file size — corrupted header"
+                pos += _EVLR_HEADER_BYTES + payload
+    return True, ""
 
 
 def validate_las(path: str | Path, strict_las14: bool = False) -> ValidationResult:

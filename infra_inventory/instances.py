@@ -24,14 +24,32 @@ def grid_components(
 
     Returns lists of point indices, one per component with at least
     ``min_cells`` occupied cells.
+
+    The point -> cell grouping is vectorized (sort by cell key, then split at
+    group boundaries) while the connectivity BFS stays the same. The cell dict
+    is inserted in original first-occurrence order and each cell's point list
+    keeps original point order, so the returned components are identical to a
+    pure-Python build.
     """
     selected = np.flatnonzero(mask)
     if not len(selected):
         return []
-    coordinates = np.floor(np.column_stack((x[selected], y[selected])) / resolution).astype(np.int64)
+    cell_x = np.floor(x[selected] / resolution).astype(np.int64)
+    cell_y = np.floor(y[selected] / resolution).astype(np.int64)
+    # Sort by (cell_y, cell_x, original position): cells are contiguous AND each
+    # cell's points stay in original order.
+    order = np.lexsort((selected, cell_y, cell_x))
+    scx, scy, ssel = cell_x[order], cell_y[order], selected[order]
+    key = np.column_stack((scx, scy))
+    starts = np.flatnonzero(np.concatenate(([True], (key[1:] != key[:-1]).any(axis=1))))
+    ends = np.concatenate((starts[1:], [len(order)]))
+    # Dict insertion order must match the old per-point loop (first occurrence
+    # in original point order) so the BFS yields identical component order.
+    first_original = ssel[starts]
     index_by_cell: Dict[Tuple[int, int], List[int]] = {}
-    for index, cell in zip(selected.tolist(), coordinates.tolist()):
-        index_by_cell.setdefault((cell[0], cell[1]), []).append(index)
+    for position in np.argsort(first_original, kind="stable"):
+        start, end = starts[position], ends[position]
+        index_by_cell[(int(scx[start]), int(scy[start]))] = ssel[start:end].tolist()
     return [
         np.asarray([index for cell in group for index in index_by_cell[cell]], dtype=np.int64)
         for group in _connected_cells(index_by_cell)

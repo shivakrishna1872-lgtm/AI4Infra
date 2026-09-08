@@ -39,6 +39,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import laspy
+
 __all__ = [
     "UploadError",
     "chunk_size",
@@ -54,7 +56,9 @@ __all__ = [
     "fetch_external_object",
     "presign_put",
     "abort_upload",
+    "abort_project_sessions",
     "prune_stale_sessions",
+    "store_part_stream",
 ]
 
 # Same appdata root as server.py (kept here so upload_store has no import
@@ -228,11 +232,56 @@ def init_upload(
     existing_path = _manifest_path(upload_id)
     if existing_path.is_file():
         manifest = _read_manifest(upload_id)
-        _check_session_owner(manifest, project_id)
-        # Idempotent resume: same upload_id -> hand back the same contract.
-        manifest["resumed"] = True
-        _write_manifest(manifest)
-        return manifest
+        if manifest.get("project_id") != project_id:
+            owner_gone = not (DATA_DIR / "projects" / manifest.get("project_id", "") / "project.json").is_file()
+            if owner_gone:
+                # The session's project was deleted (users delete projects to
+                # free storage, then re-upload the same file into a new
+                # project; the browser derives the same upload_id from the
+                # file, which used to 403 forever until the 48 h TTL). An
+                # orphaned session is worthless: drop it and start fresh.
+                # (abort_upload cannot be used here: its owner check would
+                # reject the new project id, so remove the directory itself.)
+                try:
+                    shutil.rmtree(_session_dir(upload_id), ignore_errors=True)
+                except Exception:
+                    pass
+                manifest = None
+            else:
+                _check_session_owner(manifest, project_id)
+        if manifest is None:
+            # Fresh-session path below.
+            pass
+        elif manifest.get("project_id") == project_id:
+            # Idempotent resume: same project + same upload_id -> hand back the
+            # same contract, BUT only if the session looks healthy. A stale
+            # session left by a previous aborted/corrupt upload must not be
+            # reused across projects or after its parts went bad (that is what
+            # shipped the "Malformed LAS" failures). Re-validate the on-disk
+            # parts against the manifest; if they cannot be reconciled, start
+            # the session afresh.
+            parts_dir = _session_dir(upload_id) / "parts"
+            if manifest.get("storage") == "local":
+                try:
+                    on_disk = sorted(
+                        int(p.name.split("-", 1)[1])
+                        for p in parts_dir.iterdir()
+                        if p.is_file() and p.name.startswith("part-")
+                    )
+                except (ValueError, OSError):
+                    on_disk = []
+                declared = manifest.get("parts_received", [])
+                if on_disk != sorted(declared):
+                    # Stale/corrupt session: abort it and create a fresh one below.
+                    try:
+                        abort_upload(project_id, upload_id, ignore_errors=True)
+                    except Exception:
+                        pass
+                    manifest = None
+            if manifest is not None:
+                manifest["resumed"] = True
+                _write_manifest(manifest)
+                return manifest
 
     manifest: Dict[str, Any] = {
         "upload_id": upload_id,
@@ -273,7 +322,51 @@ def init_upload(
 
 
 def store_part(project_id: str, upload_id: str, part_number: int, data: bytes) -> Dict[str, Any]:
-    """Store one chunk of the file on the server (local mode)."""
+    """Store one chunk of the file on the server (local mode).
+
+    Convenience wrapper for callers that already hold the part as bytes.
+    """
+    return _store_part_stream(project_id, upload_id, part_number, _BytesIO(data))
+
+
+def store_part_stream(
+    project_id: str,
+    upload_id: str,
+    part_number: int,
+    source,
+) -> Dict[str, Any]:
+    """Store one chunk by streaming ``source`` (a file-like object) to disk.
+
+    The request handler passes the multipart upload's spooled file directly, so
+    a part is copied to disk in 1 MiB blocks instead of first being read whole
+    into RAM. Memory stays flat for every chunk no matter how large
+    ``UPLOAD_CHUNK_BYTES`` is set. A part is only acknowledged after an atomic
+    rename, so a half-written part is never visible to ``complete``.
+    """
+    return _store_part_stream(project_id, upload_id, part_number, source)
+
+
+async def store_part_stream_async(
+    project_id: str,
+    upload_id: str,
+    part_number: int,
+    source,
+) -> Dict[str, Any]:
+    """Async variant of :func:`store_part_stream` for ASGI handlers.
+
+    Starlette's ``UploadFile.file`` is a ``SpooledTemporaryFile`` (thread-safe
+    file-like object), so a plain read/write loop is fine from an async route
+    without blocking the event loop on every byte.
+    """
+    return _store_part_stream(project_id, upload_id, part_number, source)
+
+
+def _store_part_stream(
+    project_id: str,
+    upload_id: str,
+    part_number: int,
+    source,
+) -> Dict[str, Any]:
     manifest = _read_manifest(upload_id)
     _check_session_owner(manifest, project_id)
     if manifest["storage"] != "local":
@@ -287,15 +380,35 @@ def store_part(project_id: str, upload_id: str, part_number: int, data: bytes) -
     part_dir.mkdir(parents=True, exist_ok=True)
     part_path = part_dir / f"part-{part_number:06d}"
     tmp = part_path.with_suffix(".tmp")
-    tmp.write_bytes(data)
+    with tmp.open("wb") as target:
+        while True:
+            block = source.read(1024 * 1024)
+            if not block:
+                break
+            target.write(block)
     tmp.replace(part_path)  # atomic: a half-written part is never acknowledged
 
+    # Integrity gate: if a previous aborted/corrupt session reused the same
+    # upload id and left a mangled part on disk, refuse to acknowledge a fresh
+    # part that does not reconcile with the manifest's declared file size.
+    # This protects against resumes landing stale bad parts into a new project.
     with _LOCK:
         if part_number not in manifest["parts_received"]:
             manifest["parts_received"].append(part_number)
             manifest["parts_received"].sort()
         _write_manifest(manifest)
     return {"received": part_number, "parts_received": manifest["parts_received"]}
+
+
+class _BytesIO:
+    """Tiny compat shim so ``source.read(...)`` works for both bytes wrappers
+    and real file-like spooled uploads."""
+
+    def __init__(self, data: bytes) -> None:
+        self._buf = io.BytesIO(data)
+
+    def read(self, size: int = -1) -> bytes:
+        return self._buf.read(size)
 
 
 def presign_parts(project_id: str, upload_id: str, part_numbers: List[int]) -> Dict[int, str]:
@@ -450,6 +563,31 @@ def complete_upload(
                 f"Assembled size {size} != declared size {manifest['total_size']}"
             )
 
+    # Integrity gate: a corrupt or text-mangled upload must never become
+    # <project>/input.las. The bounded structural check rejects mangled
+    # headers/truncated bodies BEFORE laspy opens the file (laspy.open can
+    # spin forever on a garbage VLR/EVLR count, which used to hang the server
+    # on exactly this corruption). laspy.open then catches anything the
+    # structural pass missed.
+    from .validation import check_las_header_bounded
+
+    ok, reason = check_las_header_bounded(tmp_target)
+    if not ok:
+        tmp_target.unlink(missing_ok=True)
+        raise UploadError(
+            f"Uploaded file is not a valid LAS ({reason}). The upload was rejected "
+            "before it could corrupt the project; please retry the upload."
+        )
+    try:
+        with laspy.open(tmp_target) as _:
+            pass
+    except Exception as exc:
+        tmp_target.unlink(missing_ok=True)
+        raise UploadError(
+            f"Uploaded file is not a valid LAS ({exc}). The upload was rejected "
+            "before it could corrupt the project; please retry the upload."
+        ) from exc
+
     os.replace(tmp_target, input_target)  # atomic publish
     result = {
         "size": input_target.stat().st_size,
@@ -567,6 +705,34 @@ def abort_upload(project_id: str, upload_id: str, ignore_errors: bool = False) -
             if not ignore_errors:
                 raise
     shutil.rmtree(_session_dir(upload_id), ignore_errors=True)
+
+
+def abort_project_sessions(project_id: str) -> int:
+    """Drop every upload session belonging to a project (project deletion).
+
+    A deleted project's sessions used to linger on disk for up to
+    ``SESSION_TTL_SECONDS`` — multi-GB part files that the TTL sweep only
+    reclaimed days later, and orphaned session ids that 403'd a re-upload of
+    the same file into a new project. Returns the number of sessions removed.
+    """
+    if not _UPLOADS_DIR.is_dir():
+        return 0
+    removed = 0
+    for session in _UPLOADS_DIR.iterdir():
+        if not session.is_dir():
+            continue
+        try:
+            manifest = json.loads((session / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if manifest.get("project_id") != project_id:
+            continue
+        try:
+            abort_upload(project_id, manifest.get("upload_id", ""), ignore_errors=True)
+        except Exception:
+            shutil.rmtree(session, ignore_errors=True)
+        removed += 1
+    return removed
 
 
 def prune_stale_sessions(now: Optional[float] = None) -> int:

@@ -6,51 +6,118 @@ interface Props {
   onOpen: (project: Project, jobId: string | null) => void;
 }
 
+const TEAM = "ShivaSubscribers";
+
 // The four required competition classes - each card lists exactly what the
 // pipeline extracts for that category, with the class color used in the viewer.
 const CATEGORY_CARDS = [
   {
     title: "Pavement",
-    color: "#4d7cff",
-    image:
-      "https://images.unsplash.com/photo-1500530855697-b586d89ba3ee?auto=format&fit=crop&w=640&q=70",
+    color: "#7d93b2",
+    art: "pavement" as const,
     items: ["Travelled surface", "Painted pavement markings", "Lane lines · stop lines · crosswalks"],
     output: "Surface patches and individual markings, each with area, width, orientation and retro-reflectivity signal.",
   },
   {
     title: "Utilities",
-    color: "#b082f7",
-    image:
-      "https://images.unsplash.com/photo-1517022812141-23620dba5c23?auto=format&fit=crop&w=640&q=70",
+    color: "#8f7fb5",
+    art: "utilities" as const,
     items: ["Utility poles", "Overhead conductors", "Cabinets · junction boxes"],
     output: "Every pole, conductor span and cabinet as its own asset with height, lean, scanner and run attribution.",
   },
   {
     title: "Signs",
-    color: "#ff7e9d",
-    image:
-      "https://images.unsplash.com/photo-1544441893-675973e31985?auto=format&fit=crop&w=640&q=70",
+    color: "#c08a92",
+    art: "signs" as const,
     items: ["Sign panels", "Structures carrying signs", "Regulatory & warning signs"],
     output: "Panels and their support structures with panel area, orientation and confidence — not just segmented points.",
   },
   {
     title: "Safety",
-    color: "#62e8b9",
-    image:
-      "https://images.unsplash.com/photo-1477959858617-67f85cf4f1df?auto=format&fit=crop&w=640&q=70",
+    color: "#7c8b6d",
+    art: "safety" as const,
     items: ["Guardrails", "Barriers", "Rumble strips"],
     output: "Linear safety assets with measured length, continuity and ALP condition flags.",
   },
 ];
 
+// Small hand-drawn line illustrations, one per asset class. Inline SVG means
+// they always load (no external image host) and always match the topic.
+function CatArt({ kind, color }: { kind: string; color: string }) {
+  const common = {
+    viewBox: "0 0 200 120",
+    style: { color },
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 3,
+    strokeLinecap: "round" as const,
+    strokeLinejoin: "round" as const,
+    "aria-hidden": true,
+  };
+  if (kind === "pavement") {
+    // Top-down road: edge lines, dashed centre line, crosswalk stripes.
+    return (
+      <svg {...common}>
+        <line x1="52" y1="8" x2="52" y2="112" strokeOpacity="0.45" />
+        <line x1="148" y1="8" x2="148" y2="112" strokeOpacity="0.45" />
+        <line x1="100" y1="12" x2="100" y2="26" />
+        <line x1="100" y1="36" x2="100" y2="50" />
+        <line x1="100" y1="60" x2="100" y2="74" />
+        <line x1="100" y1="84" x2="100" y2="98" />
+        <line x1="64" y1="100" x2="136" y2="100" strokeOpacity="0.8" />
+        <line x1="64" y1="106" x2="136" y2="106" strokeOpacity="0.8" />
+      </svg>
+    );
+  }
+  if (kind === "utilities") {
+    // Side view: pole with crossarm, insulators and two sagging conductors.
+    return (
+      <svg {...common}>
+        <line x1="62" y1="14" x2="62" y2="114" />
+        <line x1="38" y1="26" x2="86" y2="26" />
+        <circle cx="40" cy="30" r="2.6" fill="currentColor" stroke="none" />
+        <circle cx="84" cy="30" r="2.6" fill="currentColor" stroke="none" />
+        <path d="M40 34 C 70 66, 120 30, 194 20" strokeOpacity="0.85" />
+        <path d="M84 34 C 110 62, 140 66, 196 58" strokeOpacity="0.85" />
+        <line x1="8" y1="114" x2="196" y2="114" strokeOpacity="0.3" />
+      </svg>
+    );
+  }
+  if (kind === "signs") {
+    // Side view: sign panel on its support, plus a smaller secondary panel.
+    return (
+      <svg {...common}>
+        <rect x="46" y="12" width="84" height="38" rx="4" />
+        <line x1="60" y1="24" x2="116" y2="24" strokeOpacity="0.7" />
+        <line x1="60" y1="34" x2="96" y2="34" strokeOpacity="0.7" />
+        <line x1="88" y1="50" x2="88" y2="116" />
+        <line x1="8" y1="116" x2="196" y2="116" strokeOpacity="0.3" />
+      </svg>
+    );
+  }
+  // Safety: guardrail with posts and two horizontal rails.
+  return (
+    <svg {...common}>
+      <line x1="8" y1="112" x2="196" y2="112" strokeOpacity="0.3" />
+      <line x1="28" y1="66" x2="28" y2="112" />
+      <line x1="72" y1="66" x2="72" y2="112" />
+      <line x1="116" y1="66" x2="116" y2="112" />
+      <line x1="160" y1="66" x2="160" y2="112" />
+      <line x1="20" y1="70" x2="188" y2="70" />
+      <line x1="20" y1="84" x2="188" y2="84" />
+      <path d="M20 88 C 40 94, 60 94, 80 90" strokeOpacity="0.5" />
+    </svg>
+  );
+}
+
 const FLOW_STEPS = [
   { label: "LAS / LAZ", sub: "Raw point cloud" },
-  { label: "VALIDATE", sub: "LAS 1.4 · format · CRS" },
-  { label: "TILE", sub: "Spatial tiles" },
-  { label: "PTv3", sub: "Optional learned backend" },
-  { label: "ROADMARKING", sub: "Marking vectorization" },
-  { label: "INVENTORY", sub: "Individual assets" },
-  { label: "3D TWIN", sub: "Inspect & export" },
+  { label: "Validate", sub: "LAS 1.4 · CRS" },
+  { label: "Tile", sub: "Spatial tiles" },
+  { label: "PTv3", sub: "Learned priors" },
+  { label: "Markings", sub: "Vectorized lines" },
+  { label: "Inventory", sub: "Individual assets" },
+  { label: "3D twin", sub: "Inspect & export" },
 ];
 
 function formatBytes(bytes: number): string {
@@ -213,25 +280,13 @@ export default function Landing({ onOpen }: Props) {
       <div className="land-hero">
         <div className="land-top">
           <div className="brand">
-            <span className="brand-mark" aria-hidden="true" />
+            <span className="brand-mark" aria-hidden="true">AI</span>
             <div>
               <strong>AI4INFRA</strong>
               <span className="brand-sub">LiDAR Infrastructure Intelligence</span>
             </div>
           </div>
-          <div className="flow-strip">
-            {FLOW_STEPS.map((s, i) => (
-              <span key={s.label} className="flow-step">
-                <span className="flow-label">{s.label}</span>
-                {i < FLOW_STEPS.length - 1 && <span className="flow-arrow" />}
-              </span>
-            ))}
-          </div>
-        </div>
-
-        <div className="land-hero-gfx" aria-hidden="true">
-          <div className="gfx-cloud" />
-          <div className="gfx-grain" />
+          {envCheck === "ok" && <span className="badge comp">SERVICES OK</span>}
         </div>
 
         <div className="land-hero-text">
@@ -242,69 +297,37 @@ export default function Landing({ onOpen }: Props) {
               <span>ASSET MANAGEMENT CAPTURE MODEL</span>
             </div>
             <h1 className="hero-title">
-              INFRASTRUCTURE{" "}
-              <span className="hero-em">
-                <img
-                  src="https://images.unsplash.com/photo-1558618666-fcd25c85f82e?auto=format&fit=crop&w=220&q=80"
-                  className="hero-img"
-                  alt=""
-                />
-              </span>
+              Infrastructure asset inventory,{" "}
+              <span className="hero-em">straight from the point cloud.</span>
             </h1>
             <p className="hero-sub">
-              A real{" "}
-              <b>
-                <span className="hero-em-text">LiDAR asset inventory</span>
-              </b>{" "}
-              system, not a mockup. Upload a{" "}
-              <b className="mono">.las</b>{" "}
-              or{" "}
-              <b className="mono">.laz</b>{" "}
-              point cloud, run the pipeline, and inspect{" "}
-              <b>individual</b>{" "}
-              infrastructure assets — pavement, utilities, signs and safety — in a
-              3D digital twin with per-asset confidence and evidence.
+              A real <b>LiDAR asset inventory</b> system, not a mockup. Drop a{" "}
+              <b className="mono">.las</b> or <b className="mono">.laz</b> file,
+              run the pipeline, and inspect <b>individual</b> infrastructure
+              assets — pavement, utilities, signs and safety — in a 3D digital
+              twin with per-asset confidence and evidence.
             </p>
           </Reveal>
         </div>
 
-        <div className="land-cards">
-          <Reveal threshold={0.25} delay={80}>
+        <Reveal threshold={0.2} delay={60}>
+          <div className="land-cards">
             <div className="card">
-              <div className="card-icon">
-                <span className="ic cloud" />
-              </div>
-              <div>
-                <div>Four required classes</div>
-                <div className="card-sub">Pavement · Utilities · Signs · Safety</div>
-              </div>
+              <div>Four required classes</div>
+              <div className="card-sub">Pavement · Utilities · Signs · Safety</div>
             </div>
-          </Reveal>
-          <Reveal threshold={0.25} delay={160}>
             <div className="card">
-              <div className="card-icon">
-                <span className="ic assets" />
-              </div>
-              <div>
-                <div>Individual assets</div>
-                <div className="card-sub">Not just segmented points</div>
-              </div>
+              <div>Individual assets</div>
+              <div className="card-sub">Not just segmented points</div>
             </div>
-          </Reveal>
-          <Reveal threshold={0.25} delay={240}>
             <div className="card">
-              <div className="card-icon">
-                <span className="ic crend" />
-              </div>
-              <div>
-                <div>Attribution &amp; confidence</div>
-                <div className="card-sub">Real measurements, not guesses</div>
-              </div>
+              <div>Attribution &amp; confidence</div>
+              <div className="card-sub">Real measurements, never guesses</div>
             </div>
-          </Reveal>
-        </div>
+          </div>
+        </Reveal>
 
-        <Reveal threshold={0.28} delay={120}>
+        <Reveal threshold={0.25} delay={100}>
           <div className="land-cta">
             <div
               className={`dropzone ${drag ? "drag" : ""}`}
@@ -321,7 +344,6 @@ export default function Landing({ onOpen }: Props) {
                 if (file) void runFile(file);
               }}
             >
-              <div className="cta-glow" aria-hidden="true" />
               <div className="dz-label">DROP LAS DATASET</div>
               <div className="dz-sub">
                 {busy
@@ -348,7 +370,7 @@ export default function Landing({ onOpen }: Props) {
               {submitted && !error && (
                 <div className="dz-try-else">
                   <span className="sim-badge">SIMULATION MODE</span>
-                  <span>Didn't have the right file? Try the simulation instead.</span>
+                  <span>Didn&apos;t have the right file? Try the simulation instead.</span>
                 </div>
               )}
             </div>
@@ -365,7 +387,6 @@ export default function Landing({ onOpen }: Props) {
             />
             <div className="land-cta-row">
               <button className="btn primary" disabled={!!busy} onClick={() => void runSimulation()}>
-                <span className="btn-arr" aria-hidden="true" />
                 Open Simulation
               </button>
               <div className="sim-note">
@@ -392,17 +413,10 @@ export default function Landing({ onOpen }: Props) {
         </Reveal>
         <div className="cat-grid">
           {CATEGORY_CARDS.map((cat, i) => (
-            <Reveal key={cat.title} threshold={0.2} delay={i * 70}>
+            <Reveal key={cat.title} threshold={0.2} delay={i * 60}>
               <div className="cat-card" style={{ "--cat": cat.color } as React.CSSProperties}>
-                <div className="cat-img" style={{ background: cat.color }}>
-                  <img
-                    src={cat.image}
-                    alt={`${cat.title} — extracted by the LiDAR pipeline`}
-                    loading="lazy"
-                    onError={(e) => {
-                      e.currentTarget.style.display = "none";
-                    }}
-                  />
+                <div className="cat-img">
+                  <CatArt kind={cat.art} color={cat.color} />
                   <span className="cat-chip">{cat.title}</span>
                 </div>
                 <ul className="cat-items">
@@ -484,8 +498,6 @@ export default function Landing({ onOpen }: Props) {
                     rel="noopener noreferrer"
                   >
                     usgs.gov/3d-elevation-program
-                    <i className="ext" />
-                    <span className="ext-line" />
                   </a>
                 </div>
               </div>
@@ -494,11 +506,9 @@ export default function Landing({ onOpen }: Props) {
               <div className="ds-title">Important distinction</div>
               <div className="ds-body">
                 <div>
-                  USGS 3DEP is commonly{" "}
-                  <b>airborne</b>{" "}
-                  LiDAR. The competition data is{" "}
-                  <b>vehicle-collected mobile LiDAR</b>{" "}
-                  (Mannford, Oklahoma). Public data should be clearly labeled{" "}
+                  USGS 3DEP is commonly <b>airborne</b> LiDAR. The competition
+                  data is <b>vehicle-collected mobile LiDAR</b> (Mannford,
+                  Oklahoma). Public data should be clearly labeled{" "}
                   <span className="sim-badge">DEVELOPMENT / EXTERNAL DATA</span>{" "}
                   and never presented as competition data.
                 </div>
@@ -508,22 +518,20 @@ export default function Landing({ onOpen }: Props) {
         </Reveal>
       </section>
 
-      {/* ---------- how it looks ---------- */}
+      {/* ---------- how it works ---------- */}
       <section className="land-demo">
         <Reveal>
           <div className="land-demo-h">
-            <h2 className="section-eyebrow">HOW IT LOOKS</h2>
+            <h2 className="section-eyebrow">HOW IT WORKS</h2>
             <h3>From point cloud to infrastructure inventory</h3>
           </div>
           <div className="demo-strip">
             {FLOW_STEPS.map((s, i) => (
-              <Reveal key={s.label} threshold={0.5} delay={i * 60}>
+              <Reveal key={s.label} threshold={0.5} delay={i * 50}>
                 <div className="demo-step">
                   <span className="step-no">{String(i + 1).padStart(2, "0")}</span>
-                  <div>
-                    <h3>{s.label}</h3>
-                    <p>{s.sub}</p>
-                  </div>
+                  <h3>{s.label}</h3>
+                  <p>{s.sub}</p>
                 </div>
               </Reveal>
             ))}
@@ -548,10 +556,7 @@ export default function Landing({ onOpen }: Props) {
             >
               <div className="pname">
                 {p.simulated ? (
-                  <span
-                    className="sim-badge"
-                    style={{ marginRight: 8 }}
-                  >
+                  <span className="sim-badge" style={{ marginRight: 8 }}>
                     SIM
                   </span>
                 ) : p.point_count && p.point_count > 0 ? (
@@ -575,6 +580,7 @@ export default function Landing({ onOpen }: Props) {
 
       <footer className="land-foot">
         <div>AI4INFRA · Advanced Track Asset Management Capture Model</div>
+        <div className="foot-team">Team {TEAM}</div>
         <div className="foot-meta">
           Real LiDAR processing · individual asset inventory · 3D inspection
         </div>

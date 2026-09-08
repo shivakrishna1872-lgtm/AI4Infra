@@ -70,21 +70,23 @@ def estimate_ground_z(z: np.ndarray, x: np.ndarray, y: np.ndarray, bin_m: float,
     vegetation/object outliers), then return the ``quantile`` of the cell
     minima. This is far more robust than a global z quantile on roads with
     curbs, drainage, and parked objects.
+
+    Vectorized: per-cell minima come from a sort-by-cell + ``np.minimum.reduceat``
+    (identical values to the old dict loop; quantiles are order-insensitive).
     """
     if len(z) == 0:
         return 0.0
-    cell_x = np.floor(x / bin_m).astype(np.int64)
-    cell_y = np.floor(y / bin_m).astype(np.int64)
-    minima: Dict[Tuple[int, int], float] = {}
-    for key, zz in zip(zip(cell_x.tolist(), cell_y.tolist()), z.tolist()):
-        if not np.isfinite(zz):
-            continue
-        current = minima.get(key)
-        if current is None or zz < current:
-            minima[key] = zz
-    if not minima:
+    finite = np.isfinite(z)
+    if not finite.any():
         return float(np.quantile(z, quantile))
-    values = np.asarray(list(minima.values()), dtype=np.float64)
+    xf, yf, zf = x[finite], y[finite], z[finite]
+    cell_x = np.floor(xf / bin_m).astype(np.int64)
+    cell_y = np.floor(yf / bin_m).astype(np.int64)
+    order = np.lexsort((cell_y, cell_x))
+    sorted_z = zf[order]
+    key = np.column_stack((cell_x, cell_y))[order]
+    starts = np.flatnonzero(np.concatenate(([True], (key[1:] != key[:-1]).any(axis=1))))
+    values = np.minimum.reduceat(sorted_z, starts)
     low = float(np.quantile(values, 0.01))
     filtered = values[values >= low]
     # Fall back to a global quantile if the cells are degenerate (e.g. all points vertical)
@@ -123,17 +125,23 @@ def local_density(x: np.ndarray, y: np.ndarray, resolution: float, radius_cells:
 
 
 def cell_z_ranges(x: np.ndarray, y: np.ndarray, z: np.ndarray, resolution: float) -> np.ndarray:
-    """Per-point z-range of its cell (vertical extent signal, useful for poles)."""
-    ranges: Dict[Tuple[int, int], Tuple[float, float]] = {}
+    """Per-point z-range of its cell (vertical extent signal, useful for poles).
+
+    Vectorized: points are sorted by cell, per-cell min/max come from
+    ``np.minimum/maximum.reduceat``, and each point receives its cell's range.
+    Values are identical to the old per-point dict loop.
+    """
     cell_x = np.floor(x / resolution).astype(np.int64)
     cell_y = np.floor(y / resolution).astype(np.int64)
-    for key, zz in zip(zip(cell_x.tolist(), cell_y.tolist()), z.tolist()):
-        lo, hi = ranges.get(key, (zz, zz))
-        ranges[key] = (min(lo, zz), max(hi, zz))
-    result = np.zeros(len(x), dtype=np.float64)
-    for index, key in enumerate(zip(cell_x.tolist(), cell_y.tolist())):
-        lo, hi = ranges[key]
-        result[index] = hi - lo
+    order = np.lexsort((cell_y, cell_x))
+    sorted_z = z[order]
+    key = np.column_stack((cell_x, cell_y))[order]
+    starts = np.flatnonzero(np.concatenate(([True], (key[1:] != key[:-1]).any(axis=1))))
+    ends = np.concatenate((starts[1:], [len(order)]))
+    lo = np.minimum.reduceat(sorted_z, starts)
+    hi = np.maximum.reduceat(sorted_z, starts)
+    result = np.empty(len(x), dtype=np.float64)
+    result[order] = np.repeat(hi - lo, ends - starts)
     return result
 
 

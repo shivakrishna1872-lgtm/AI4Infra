@@ -10,3 +10,11 @@ models/
 *.laz
 *.pth
 *.dxf
+
+# Runtime / build artifacts (never commit uploaded datasets or bundles)
+appdata/
+web-dist/
+web/node_modules/
+*.tsbuildinfo
+.env*
+!.env.example

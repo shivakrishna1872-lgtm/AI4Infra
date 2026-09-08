@@ -89,7 +89,13 @@ def bright_near_ground_mask(ctx: TileContext, height_max: float) -> np.ndarray:
 
 
 def road_proximity_m(ctx: TileContext, indices: np.ndarray, resolution: float = 1.0) -> Optional[float]:
-    """Mean distance from component points to the nearest pavement-occupied cell."""
+    """Mean distance from component points to the nearest pavement-occupied cell.
+
+    Vectorized: a Chebyshev distance map is grown from the pavement cells over
+    the tile's cell grid (ring dilation is 8-connectivity, matching the old
+    per-point ring search exactly). Falls back to the per-point ring search when
+    the tile extent would make the grid impractically large.
+    """
     if ctx.pavement_mask is None or ctx.pavement_mask.sum() == 0:
         return None
     if len(indices) == 0:
@@ -100,9 +106,40 @@ def road_proximity_m(ctx: TileContext, indices: np.ndarray, resolution: float = 
     px = np.floor(ctx.x[indices] / resolution).astype(np.int64)
     py = np.floor(ctx.y[indices] / resolution).astype(np.int64)
     max_search = 12
+    origin_x = int(np.floor(float(ctx.x.min()) / resolution))
+    origin_y = int(np.floor(float(ctx.y.min()) / resolution))
+    span_x = int(np.floor(float(ctx.x.max()) / resolution)) - origin_x + 1
+    span_y = int(np.floor(float(ctx.y.max()) / resolution)) - origin_y + 1
+    if span_x * span_y <= 4_000_000 and span_x > 0 and span_y > 0:
+        grid = np.zeros((span_y, span_x), dtype=bool)
+        for cx, cy in pavement_cells:
+            gx, gy = int(cx) - origin_x, int(cy) - origin_y
+            if 0 <= gx < span_x and 0 <= gy < span_y:
+                grid[gy, gx] = True
+        distances_map = np.full((span_y, span_x), float(max_search), dtype=np.float64)
+        frontier = grid.copy()
+        seen = grid.copy()
+        for ring in range(max_search + 1):
+            distances_map[frontier] = float(ring)
+            if bool(seen.all()):
+                break
+            padded = np.pad(frontier, 1)
+            dilated = (
+                padded[1:-1, 1:-1] | padded[:-2, 1:-1] | padded[2:, 1:-1]
+                | padded[1:-1, :-2] | padded[1:-1, 2:]
+                | padded[:-2, :-2] | padded[:-2, 2:] | padded[2:, :-2] | padded[2:, 2:]
+            )
+            frontier = dilated & ~seen
+            seen |= dilated
+        gx = (px - origin_x).astype(np.int64)
+        gy = (py - origin_y).astype(np.int64)
+        inside = (gx >= 0) & (gx < span_x) & (gy >= 0) & (gy < span_y)
+        distances = np.full(len(px), float(max_search), dtype=np.float64)
+        distances[inside] = distances_map[gy[inside], gx[inside]]
+        return float(distances.mean())
+    # Fallback: per-point ring-by-ring Chebyshev search.
     distances = np.full(len(px), float(max_search), dtype=np.float64)
     for index, (cx, cy) in enumerate(zip(px.tolist(), py.tolist())):
-        # Ring-by-ring Chebyshev search: the first matching ring is the nearest.
         for ring in range(max_search + 1):
             if _cell_in_ring(pavement_cells, int(cx), int(cy), ring):
                 distances[index] = float(ring)

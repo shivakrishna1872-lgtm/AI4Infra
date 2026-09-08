@@ -131,21 +131,45 @@ export async function uploadLasChunked(
   onProgress?: (p: UploadProgress) => void
 ): Promise<Project> {
   // 1. Create (or resume) the session.
-  const uploadId = uploadIdFor(file);
-  const start = await request<{
+  // A stale session from a previously deleted project can still hold this
+  // file's derived upload id. The server resets orphaned sessions on its
+  // side; as a second line of defense, if the id still collides with a live
+  // session of another project, retry once WITHOUT it so the server hands out
+  // a fresh id instead of failing the upload forever.
+  const sessionCollision = (err: unknown) =>
+    err instanceof Error &&
+    /403.*belongs to a different project|belongs to a different project.*403/i.test(
+      err.message
+    );
+  let uploadId = uploadIdFor(file);
+  let start: {
     upload_id: string;
     storage: "local" | "s3";
     chunk_size: number;
     chunk_count: number;
-  }>(`/api/projects/${projectId}/uploads`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      filename: file.name,
-      total_size: file.size,
-      upload_id: uploadId,
-    }),
-  });
+  };
+  try {
+    start = await request<typeof start>(`/api/projects/${projectId}/uploads`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        filename: file.name,
+        total_size: file.size,
+        upload_id: uploadId,
+      }),
+    });
+  } catch (err) {
+    if (!sessionCollision(err)) throw err;
+    uploadId = "";
+    start = await request<typeof start>(`/api/projects/${projectId}/uploads`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filename: file.name, total_size: file.size }),
+    });
+  }
+  // Use the session id the server actually owns (client-derived on resume,
+  // server-generated after a collision fallback).
+  uploadId = start.upload_id;
 
   const { chunk_size: chunkSize, chunk_count: parts, storage } = start;
 
@@ -248,6 +272,23 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(extra ?? {}),
     }),
+
+  // Tell the server the user finished viewing this project and left. Fired
+  // with navigator.sendBeacon so it survives tab close. The server deletes
+  // the project (input.las, output, sessions) after a short grace period
+  // unless the user reopens it — processed scans stop hogging disk.
+  releaseProject: (projectId: string) => {
+    const url = `/api/projects/${projectId}/release`;
+    try {
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon(url, new Blob([]));
+      } else {
+        void fetch(url, { method: "POST", keepalive: true });
+      }
+    } catch {
+      /* best-effort: a missed release only means manual cleanup later */
+    }
+  },
 
   job: (jobId: string) => request<JobStatus>(`/api/jobs/${jobId}`),
 

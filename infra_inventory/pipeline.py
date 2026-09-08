@@ -19,19 +19,22 @@ attributes, and confidence breakdown - nothing is invented.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import multiprocessing
 import os
 import shutil
 import time
-from collections import Counter, defaultdict
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 import laspy
 import numpy as np
 
-from .assets import TileContext, assign_ids, detect_all
+from .assets import TileContext, detect_all
 from .instances import merge_linear_pieces
 from .assessment import assess_all
 from .confidence import ConfidenceFactors, score_asset, support_score
@@ -290,17 +293,200 @@ def _stream_tiles(
     return summary, tile_names, viewer
 
 
-def _detect_tile(
+def _available_workers() -> int:
+    """Cores available to this process, honoring cgroup CPU quotas.
+
+    The detectors are GIL-bound Python (numpy releases the GIL but the
+    per-component loops do not), so worker processes - never threads - are used
+    for the tile pass. Oversubscribing hurts (context-switch overhead), so the
+    worker count follows the cgroup quota (e.g. 200000/100000 = 2 CPUs) when
+    one is set, capped at 16.
+    """
+    try:
+        quota = Path("/sys/fs/cgroup/cpu.max").read_text(encoding="utf-8").strip()
+        if quota and quota != "max":
+            maximum_text, period_text = quota.split()  # format: <quota> <period>
+            period, maximum = int(period_text), int(maximum_text)
+            if period > 0 and maximum > 0:
+                return max(1, min(16, maximum // period))
+    except (OSError, ValueError):
+        pass
+    try:
+        quota_us = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text(encoding="utf-8").strip())
+        period_us = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text(encoding="utf-8").strip())
+        if quota_us > 0 and period_us > 0:
+            return max(1, min(16, -(-quota_us // period_us)))
+    except (OSError, ValueError):
+        pass
+    return max(1, min(16, (os.cpu_count() or 4)))
+
+
+def _file_sha256(path: Path) -> str:
+    """SHA-256 of a file (streamed, bounded memory)."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _write_tile_manifest(tiles_dir: Path, tile_names: List[str], input_sha256: str) -> None:
+    """Persist the tile manifest immediately after streaming.
+
+    Written *before* detection so a crashed run can be resumed from the tiles on
+    disk (the SHA-256 binds the tiles to the exact input file).
+    """
+    tiles_dir.mkdir(parents=True, exist_ok=True)
+    (tiles_dir / "manifest.json").write_text(
+        json.dumps({
+            "tiles": tile_names,
+            "count": len(tile_names),
+            "order": "streaming append order",
+            "input_sha256": input_sha256,
+        }, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _pool_viewer_from_tiles(
+    tiles_dir: Path, tile_names: List[str], settings: ProcessingSettings, metadata: object,
+) -> Tuple[dict, List[int], int]:
+    """Rebuild the viewer LOD pool (and run/scanner provenance) from existing tiles.
+
+    Resume path: the streaming pass is skipped, so the bounded viewer pool that
+    was collected while streaming must be re-derived from the tiles themselves.
+    Mirrors the pooling logic in ``_stream_tiles`` exactly (strided pool then
+    voxel downsample), so the exported viewer payload is identical to a fresh run.
+    """
+    viewer: dict = {"points": [], "point_colors": [], "point_rgb": None, "point_intensity": None}
+    if metadata.has_rgb:
+        viewer["point_rgb"] = []
+    if metadata.has_intensity:
+        viewer["point_intensity"] = []
+    pool_limit = min(settings.viewer_point_limit * 4, 500_000)
+    pool_stride = max(1, math.ceil(metadata.point_count / pool_limit))
+    pool_x: List[float] = []
+    pool_y: List[float] = []
+    pool_z: List[float] = []
+    pool_rgb: List[List[float]] = []
+    pool_intensity: List[float] = []
+    scanner_ids: List[int] = []
+    saw_run2 = False
+    for tile_name in tile_names:
+        with laspy.open(tiles_dir / f"{tile_name}.las") as reader:
+            chunk = next(reader.chunk_iterator(10_000_000), None)
+        if chunk is None or not len(chunk.x):
+            continue
+        x = np.asarray(chunk.x, dtype=np.float64)
+        y = np.asarray(chunk.y, dtype=np.float64)
+        z = np.asarray(chunk.z, dtype=np.float64)
+        names = set(chunk.point_format.dimension_names)
+        mask = np.arange(len(x)) % pool_stride == 0
+        if mask.any():
+            pool_x.extend(x[mask].tolist())
+            pool_y.extend(y[mask].tolist())
+            pool_z.extend(z[mask].tolist())
+            if metadata.has_rgb and {"red", "green", "blue"}.issubset(names):
+                rgb = np.column_stack((np.asarray(chunk.red), np.asarray(chunk.green), np.asarray(chunk.blue)))
+                pool_rgb.extend(np.clip(rgb[mask] / 65535.0, 0.0, 1.0).round(4).tolist())
+            if metadata.has_intensity and "intensity" in names:
+                values = np.asarray(chunk.intensity)[mask]
+                if values.max() > 0:
+                    pool_intensity.extend(np.clip(values / float(values.max()), 0.0, 1.0).round(4).tolist())
+        if "point_source_id" in names:
+            scanner_ids.extend(int(v) for v in np.unique(chunk.point_source_id) if int(v) > 0)
+        if metadata.has_gps_time and "gps_time" in names:
+            labels = gps_run_labels(chunk.gps_time)
+            if labels is not None and np.any(labels == 2):
+                saw_run2 = True
+    z0, _, _, z1, _, _ = metadata.bounds
+    if pool_x:
+        px = np.asarray(pool_x, dtype=np.float64)
+        py = np.asarray(pool_y, dtype=np.float64)
+        pz = np.asarray(pool_z, dtype=np.float64)
+        keep = voxel_downsample(px, py, pz, settings.viewer_point_limit)
+        viewer["points"] = np.column_stack((px[keep], py[keep], pz[keep])).round(4).tolist()
+        z01 = (pz[keep] - z0) / max((z1 - z0), 1e-6)
+        viewer["point_colors"] = _elevation_color(z01)
+        if metadata.has_rgb and pool_rgb:
+            viewer["point_rgb"] = [pool_rgb[i] for i in keep.tolist()]
+        if metadata.has_intensity and pool_intensity:
+            viewer["point_intensity"] = [pool_intensity[i] for i in keep.tolist()]
+    if not viewer["point_rgb"]:
+        viewer["point_rgb"] = None
+    if not viewer["point_intensity"]:
+        viewer["point_intensity"] = None
+    return viewer, sorted(set(scanner_ids)), (2 if saw_run2 else (1 if metadata.has_gps_time else 0))
+
+
+def _asset_from_dict(record: dict) -> Asset:
+    """Rebuild an Asset from its exported record (cache round-trip)."""
+    return Asset(
+        asset_id=record["asset_id"], asset_class=record["class"], subclass=record.get("subclass"),
+        center=record["center"], bounding_box=tuple(record["bounding_box"]),
+        dimensions=record.get("dimensions") or {}, point_count=record["point_count"],
+        source_tile=record["source_tile"],
+        source_point_indices_sample=record.get("source_point_indices_sample", []),
+        coordinate_reference_system=record.get("coordinate_reference_system"),
+        confidence=record["confidence"], confidence_factors=record.get("confidence_factors") or {},
+        confidence_explanation=record.get("confidence_explanation", ""),
+        detection_method=record.get("detection_method", ""),
+        intensity_stats=record.get("intensity_stats"), rgb_stats=record.get("rgb_stats"),
+        orientation_deg=record.get("orientation_deg"), source_run=record.get("source_run"),
+        source_scanner=record.get("source_scanner"),
+        source_point_source_id=record.get("source_point_source_id"),
+        model_prior_class=record.get("model_prior_class"),
+        model_confidence=record.get("model_confidence"),
+        processing_version=record.get("processing_version", "0.3.0"),
+        geometry=record.get("geometry"), qc_flags=list(record.get("qc_flags") or []),
+        flagged=bool(record.get("flagged")), condition=record.get("condition"),
+        recommended_action=record.get("recommended_action"),
+        review_required=bool(record.get("review_required")),
+        assessment_reasoning=record.get("assessment_reasoning"),
+    )
+
+
+def _write_tile_cache(cache_dir: Path, tile_name: str, tile_assets: List[Asset], point_count: int) -> None:
+    """Persist one tile's extracted assets (atomic write)."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    path = cache_dir / f"{tile_name}.json"
+    tmp = cache_dir / f"{tile_name}.json.tmp"
+    tmp.write_text(
+        json.dumps({"point_count": point_count, "assets": [a.to_dict() for a in tile_assets]}),
+        encoding="utf-8",
+    )
+    tmp.replace(path)
+
+
+def _read_tile_cache(cache_dir: Path, tile_name: str) -> Optional[Tuple[List[Asset], int]]:
+    """Load a tile's cached extraction, or None when absent/corrupt."""
+    path = cache_dir / f"{tile_name}.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return [_asset_from_dict(a) for a in data["assets"]], int(data["point_count"])
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        return None
+
+
+def _extract_tile_assets(
     tiles_dir: Path, tile_name: str, summary: RunSummary, settings: ProcessingSettings,
-    id_counts: Counter, predictions: Dict[str, np.ndarray], class_names: List[str],
-    class_mapping: Dict[str, Dict[str, object]], sample_stride: int, progress: bool,
-) -> List[Asset]:
-    """Pass 3: one tile -> assets (ground, features, detectors, attribution)."""
+    predictions: Dict[str, np.ndarray], class_names: List[str],
+    class_mapping: Dict[str, Dict[str, object]], sample_stride: int,
+) -> Tuple[List[Asset], int]:
+    """Pass 3 (worker): one tile -> assets (ground, features, detectors, attribution).
+
+    Thread-safe by construction: no shared mutable state (a per-worker
+    throwaway Counter is used for the TileContext, and asset IDs are assigned
+    afterwards, sequentially, so outputs are byte-identical to a single-threaded
+    run). Returns ``(assets, point_count)``.
+    """
     tile_path = tiles_dir / f"{tile_name}.las"
     with laspy.open(tile_path) as reader:
         chunk = next(reader.chunk_iterator(10_000_000), None)
     if chunk is None or len(chunk.x) < settings.min_asset_points:
-        return []
+        return [], 0
     x = np.asarray(chunk.x, dtype=np.float64)
     y = np.asarray(chunk.y, dtype=np.float64)
     z = np.asarray(chunk.z, dtype=np.float64)
@@ -325,20 +511,23 @@ def _detect_tile(
         source_indices=np.arange(len(x), dtype=np.int64),
         gps_labels=gps_run_labels(gps_time), point_source_id=point_source_id, crs=summary.crs,
         model_class=model_class, class_names=class_names, mapping=class_mapping,
-        settings=settings, id_counts=id_counts, sample_stride=sample_stride, viewer_limit=settings.viewer_point_limit,
+        settings=settings, id_counts=Counter(), sample_stride=sample_stride,
+        viewer_limit=settings.viewer_point_limit,
     )
     assets = detect_all(ctx)
     for asset in assets:
-        assign_ids(asset, ctx)
         _attach_highlight_points(ctx, asset)
-    if progress:
-        counts = Counter(asset.asset_class for asset in assets)
-        print(
-            f"  tile {tile_name}: {len(x):,} points | assets: {len(assets)} "
-            f"| classes: {dict(counts)}",
-            flush=True,
-        )
-    return assets
+    return assets, int(len(x))
+
+
+def _assign_ids_sequential(all_assets: List[Asset], id_counts: Counter) -> None:
+    """Assign deterministic asset IDs in pipeline order (threads never share the counter)."""
+    from .models import CLASS_PREFIXES
+
+    for asset in all_assets:
+        prefix = CLASS_PREFIXES[asset.asset_class]
+        id_counts[prefix] += 1
+        asset.asset_id = f"{prefix}-{id_counts[prefix]:05d}"
 
 
 def _attach_highlight_points(ctx: TileContext, asset: Asset) -> None:
@@ -364,34 +553,69 @@ def _compute_point_classes(viewer_points: List[List[float]], assets: List[Asset]
 
     Labels are derived from the *actual* detection points (``highlight_points``)
     via a spatial grid, so the AI DETECTION coloring is real evidence, not paint.
-    Class ids start at 1; 0 = no detected asset nearby.
+    Class ids start at 1; 0 = no detected asset nearby. Vectorized: highlight
+    points are sorted by their 1 m grid cell and each viewer point looks up the
+    (up to) 27 neighbouring cells with two ``searchsorted`` calls per offset,
+    so a 250 k-point cloud labels in well under a second instead of a Python
+    triple loop.
     """
+    count = len(viewer_points)
     if not viewer_points or not assets:
-        return [0] * len(viewer_points)
+        return [0] * count
     cell = 1.0
-    grid: Dict[Tuple[int, int, int], List[Tuple[int, float, float, float]]] = defaultdict(list)
+    rows: List[Tuple[float, float, float, float]] = []
     for class_id, name in enumerate(class_names, start=1):
         for asset in assets:
             if asset.asset_class != name:
                 continue
             for point in (asset.geometry or {}).get("highlight_points", []):
-                key = (int(point[0] // cell), int(point[1] // cell), int(point[2] // cell))
-                grid[key].append((class_id, point[0], point[1], point[2]))
-    radius2 = 1.0  # metres
-    result = [0] * len(viewer_points)
-    for index, (x, y, z) in enumerate(viewer_points):
-        kx, ky, kz = int(x // cell), int(y // cell), int(z // cell)
-        best, best_d2 = 0, radius2 * radius2
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                for dz in (-1, 0, 1):
-                    for class_id, px, py, pz in grid.get((kx + dx, ky + dy, kz + dz), ()):
-                        d2 = (x - px) ** 2 + (y - py) ** 2 + (z - pz) ** 2
-                        if d2 < best_d2:
-                            best_d2 = d2
-                            best = class_id
-        result[index] = best
-    return result
+                rows.append((class_id, point[0], point[1], point[2]))
+    if not rows:
+        return [0] * count
+    highlight = np.asarray(rows, dtype=np.float64)  # (M, 4): class, x, y, z
+    hx = np.floor(highlight[:, 1] / cell).astype(np.int64)
+    hy = np.floor(highlight[:, 2] / cell).astype(np.int64)
+    hz = np.floor(highlight[:, 3] / cell).astype(np.int64)
+    order = np.lexsort((hz, hy, hx))  # cell-sorted: each cell's points are contiguous
+    hx, hy, hz, highlight = hx[order], hy[order], hz[order], highlight[order]
+    cell_keys = np.column_stack((hx, hy, hz)).view(
+        np.dtype([("a", "i8"), ("b", "i8"), ("c", "i8")])
+    ).ravel()
+
+    points = np.asarray(viewer_points, dtype=np.float64)  # (N, 3)
+    vx, vy, vz = points[:, 0], points[:, 1], points[:, 2]
+    vcx = np.floor(vx / cell).astype(np.int64)
+    vcy = np.floor(vy / cell).astype(np.int64)
+    vcz = np.floor(vz / cell).astype(np.int64)
+    radius2 = 1.0  # metres (squared)
+    best = np.full(count, radius2 * radius2, dtype=np.float64)
+    best_class = np.zeros(count, dtype=np.int64)
+    index_range = np.arange(count, dtype=np.int64)
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for dz in (-1, 0, 1):
+                target = np.column_stack((vcx + dx, vcy + dy, vcz + dz)).view(
+                    np.dtype([("a", "i8"), ("b", "i8"), ("c", "i8")])
+                ).ravel()
+                start = np.searchsorted(cell_keys, target, side="left")
+                end = np.searchsorted(cell_keys, target, side="right")
+                lengths = end - start
+                total = int(lengths.sum())
+                if total == 0:
+                    continue
+                owner = np.repeat(index_range, lengths)
+                segment_begin = np.repeat(np.cumsum(lengths) - lengths, lengths)
+                hl = start[owner] + (np.arange(total, dtype=np.int64) - segment_begin)
+                d2 = (
+                    (vx[owner] - highlight[hl, 1]) ** 2
+                    + (vy[owner] - highlight[hl, 2]) ** 2
+                    + (vz[owner] - highlight[hl, 3]) ** 2
+                )
+                improved = d2 < best[owner]
+                updated = owner[improved]
+                best[updated] = d2[improved]
+                best_class[updated] = highlight[hl[improved], 0].astype(np.int64)
+    return best_class.tolist()
 
 
 def _assets_from_roadmarking(
@@ -487,7 +711,48 @@ def process_las(
             })
 
     report("validating", message="Validating LAS metadata")
-    summary, tile_names, viewer = _stream_tiles(path, output, settings, progress, progress_callback)
+    # Resume path: a crashed/interrupted run left its per-tile LAS files and
+    # manifest on disk; when the manifest's input SHA-256 matches this exact
+    # input file, skip the streaming pass (which would re-decompress and
+    # re-write multi-GB tiles, and can hit 507 on a nearly full disk). The
+    # viewer pool and run/scanner provenance are re-derived from the tiles, so
+    # the exported artifacts are identical to a fresh run.
+    summary: Optional[RunSummary] = None
+    tile_names: List[str] = []
+    viewer: dict = {}
+    tiles_dir = output / "tiles"
+    if settings.resume_from_tiles:
+        manifest_path = tiles_dir / "manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            existing = [t for t in manifest.get("tiles", [])
+                        if (tiles_dir / f"{t}.las").is_file()]
+            if existing and manifest.get("input_sha256") == _file_sha256(path):
+                validation = validate_las(path, strict_las14=settings.strict_las14)
+                metadata = validation.metadata
+                resumed_summary = RunSummary(
+                    input_path=str(path), point_count=metadata.point_count,
+                    bounds=metadata.bounds, crs=metadata.crs, las_version=metadata.version,
+                    point_format=metadata.point_format,
+                    warnings=list(validation.as_warning_messages()),
+                    tile_count=len(existing), scanner_ids=[], run_count=0,
+                    processing_version=VERSION,
+                )
+                viewer, scanner_ids, run_count = _pool_viewer_from_tiles(
+                    tiles_dir, existing, settings, metadata)
+                resumed_summary.scanner_ids = scanner_ids
+                resumed_summary.run_count = run_count
+                resumed_summary.warnings.append(
+                    f"Resumed from {len(existing)} existing tiles (streaming pass skipped; "
+                    "input verified by SHA-256)."
+                )
+                summary = resumed_summary
+                tile_names = existing
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            summary = None
+    if summary is None:
+        summary, tile_names, viewer = _stream_tiles(path, output, settings, progress, progress_callback)
+        _write_tile_manifest(tiles_dir, tile_names, _file_sha256(path))
 
     # ---- Optional learned backend: Pointcept / PTv3 ---------------------------
     predictions: Dict[str, np.ndarray] = {}
@@ -567,19 +832,63 @@ def process_las(
             "(detection_method: roadmarkingextraction-v1)."
         )
 
-    # ---- Detection pass ---------------------------------------------------------
+    # ---- Detection pass (parallel across cores) ----------------------------------
+    # Tiles are independent units: each worker reads its own tile and runs the
+    # detectors on it. The detectors are GIL-bound Python, so a *process* pool
+    # is used (threads measured *slower* than one worker). Worker count follows
+    # the cgroup CPU quota. Outputs stay byte-identical to a sequential run:
+    # results are reassembled in tile order and asset IDs are assigned
+    # afterwards, never inside the workers.
     id_counts: Counter = Counter()
     sample_stride = max(1, math.ceil(summary.point_count / settings.viewer_point_limit))
     all_assets: List[Asset] = []
+    # Per-tile extraction cache: a run killed mid-detection resumes from the
+    # tiles it already finished instead of redoing them (each tile's assets are
+    # deterministic, so a cached tile is identical to a fresh extraction).
+    # Cleared on fresh runs; survives only within the resume flow.
+    cache_dir = output / "tile_cache"
+    if not settings.resume_from_tiles:
+        shutil.rmtree(cache_dir, ignore_errors=True)
+    workers = _available_workers()
     if progress:
-        print(f"[detection] processing {len(tile_names)} tiles", flush=True)
+        print(f"[detection] processing {len(tile_names)} tiles on {workers} worker processes", flush=True)
+    results: Dict[int, Tuple[List[Asset], int]] = {}
+    completed = 0
+    with ProcessPoolExecutor(
+        max_workers=workers, mp_context=multiprocessing.get_context("fork")
+    ) as pool:
+        futures = {}
+        for index, tile_name in enumerate(tile_names):
+            cached = _read_tile_cache(cache_dir, tile_name)
+            if cached is not None:
+                results[index] = cached
+                continue
+            futures[pool.submit(_extract_tile_assets, output / "tiles", tile_name, summary, settings,
+                               predictions, class_names, class_mapping, sample_stride)] = index
+        try:
+            for future in as_completed(futures):
+                index = futures[future]
+                tile_assets, point_count = future.result()
+                results[index] = (tile_assets, point_count)
+                _write_tile_cache(cache_dir, tile_names[index], tile_assets, point_count)
+                completed += 1
+                report("detecting", tiles_done=completed, tiles_total=len(tile_names),
+                       message=f"Detecting assets in {tile_names[index]}")
+        except Exception:
+            for future in futures:
+                future.cancel()
+            raise
     for tile_index, tile_name in enumerate(tile_names):
-        report("detecting", tiles_done=tile_index + 1, tiles_total=len(tile_names),
-               message=f"Detecting assets in {tile_name}")
-        all_assets.extend(_detect_tile(
-            output / "tiles", tile_name, summary, settings, id_counts,
-            predictions, class_names, class_mapping, sample_stride, progress,
-        ))
+        tile_assets, point_count = results[tile_index]
+        if progress:
+            counts = Counter(asset.asset_class for asset in tile_assets)
+            print(
+                f"  tile {tile_name}: {point_count:,} points | assets: {len(tile_assets)} "
+                f"| classes: {dict(counts)}",
+                flush=True,
+            )
+        _assign_ids_sequential(tile_assets, id_counts)
+        all_assets.extend(tile_assets)
     all_assets.extend(roadmarking_assets)
     # Thin linear assets (overhead conductors) are cut by tile boundaries; join
     # the collinear pieces back into spans before QC/assessment so each span is
@@ -662,16 +971,11 @@ def process_las(
             "representative evidence points ship in the per-asset exports."
         )
     write_outputs(output, summary, qc_report, viewer)
-    tiles_dir = output / "tiles"
-    tiles_dir.mkdir(parents=True, exist_ok=True)
-    (tiles_dir / "manifest.json").write_text(
-        json.dumps({"tiles": tile_names, "count": len(tile_names), "order": "streaming append order"}, indent=2),
-        encoding="utf-8",
-    )
     write_viewer(output / "viewer")
     shutil.copy2(output / "viewer-data.json", output / "viewer" / "viewer-data.json")
     if not settings.save_tiles:
         shutil.rmtree(tiles_dir, ignore_errors=True)
+        shutil.rmtree(cache_dir, ignore_errors=True)
     if progress:
         print(
             f"[done] {len(all_assets)} assets in {summary.elapsed_seconds:.1f}s -> {output}",

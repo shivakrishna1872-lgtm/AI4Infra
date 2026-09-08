@@ -16,6 +16,7 @@ the frontend never invents infrastructure.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import threading
@@ -23,6 +24,8 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+import laspy
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,6 +41,7 @@ from .models import ProcessingSettings
 from .pipeline import process_las
 from .simulation import run_quick_simulation, run_data_simulation, run_small_synthetic
 from . import upload_store
+from .validation import check_las_header_bounded
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "appdata"
 
@@ -141,13 +145,74 @@ def _disk_full_message() -> str:
 
 
 def _ensure_disk_headroom() -> None:
-    """Fail fast with a clear 507 instead of crashing mid-write with Errno 28."""
+    """Fail fast with a clear 507 instead of crashing mid-write with Errno 28.
+
+    Projects the user has finished viewing ("released" via the frontend beacon
+    when they close the tab) are pruned first, so an upload/process retry
+    frees its own space instead of hitting 507."""
+    _prune_released()
     free = _free_disk_bytes()
     if free < MIN_FREE_DISK_BYTES:
         raise HTTPException(
             status_code=507,
             detail=_disk_full_message(),
         )
+
+
+#: How long a released project survives before auto-deletion. Short enough
+#: that "finish viewing, close the tab" frees the disk, long enough that a
+#: refresh or accidental close re-opens the project before it is gone.
+RELEASE_GRACE_SECONDS = 60
+
+
+def _release_meta(meta: dict) -> bool:
+    """Cancel a pending release (the user came back). True when changed."""
+    if "release_at" in meta:
+        meta.pop("release_at", None)
+        return True
+    return False
+
+
+def _prune_released(now: Optional[float] = None) -> int:
+    """Delete projects whose release grace period has passed.
+
+    Called at startup, before disk-headroom checks, and on every project
+    listing. Projects with a live job are never pruned (a release beacon can
+    only come from a project the user has already viewed, but guard anyway).
+    Returns the number of projects removed.
+    """
+    now = time.time() if now is None else now
+    root = DATA_DIR / "projects"
+    if not root.is_dir():
+        return 0
+    removed = 0
+    for directory in root.iterdir():
+        meta_path = directory / "project.json"
+        if not meta_path.is_file():
+            continue
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        release_at = meta.get("release_at")
+        if release_at is None or float(release_at) > now:
+            continue
+        project_id = meta.get("id", directory.name)
+        if _active_job_for_project(project_id) is not None:
+            continue
+        upload_store.abort_project_sessions(project_id)
+        jobs_dir = DATA_DIR / "jobs"
+        if jobs_dir.is_dir():
+            for path in jobs_dir.glob("*.json"):
+                try:
+                    job = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if job.get("project_id") == project_id:
+                    path.unlink(missing_ok=True)
+        shutil.rmtree(directory, ignore_errors=True)
+        removed += 1
+    return removed
 
 
 app = FastAPI(
@@ -171,6 +236,9 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 def _startup() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     _cleanup_stale_job_files()
+    pruned = _prune_released()
+    if pruned:
+        print(f"released projects pruned: {pruned}", flush=True)
     removed = upload_store.prune_stale_sessions()
     if removed:
         print(f"upload sessions pruned: {removed}", flush=True)
@@ -249,7 +317,11 @@ def _read_project(project_id: str) -> dict:
 def _save_project(project_id: str, meta: dict) -> None:
     directory = _project_dir(project_id)
     directory.mkdir(parents=True, exist_ok=True)
-    (directory / "project.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    # Atomic write: a kill/restart mid-write must never leave a truncated
+    # project.json behind (that made projects unreadable and requests 502/500).
+    tmp = directory / "project.json.tmp"
+    tmp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    tmp.replace(directory / "project.json")
 
 
 def _project_info(meta: dict) -> ProjectInfo:
@@ -286,6 +358,7 @@ def health() -> dict:
 
 @app.get("/api/projects")
 def list_projects() -> List[ProjectInfo]:
+    _prune_released()
     root = DATA_DIR / "projects"
     if not root.is_dir():
         return []
@@ -294,7 +367,12 @@ def list_projects() -> List[ProjectInfo]:
         meta_path = directory / "project.json"
         if meta_path.is_file():
             try:
-                result.append(_project_info(json.loads(meta_path.read_text(encoding="utf-8"))))
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                # Opening the list cancels any pending release: the user is
+                # back, so a closed-tab project survives its grace period.
+                if _release_meta(meta):
+                    _save_project(meta["id"], meta)
+                result.append(_project_info(meta))
             except Exception:
                 continue
     result.sort(key=lambda item: item.created_at, reverse=True)
@@ -316,7 +394,26 @@ def create_project(name: str = "Untitled scan") -> ProjectInfo:
 
 @app.get("/api/projects/{project_id}", response_model=ProjectInfo)
 def get_project(project_id: str) -> ProjectInfo:
-    return _project_info(_read_project(project_id))
+    meta = _read_project(project_id)
+    if _release_meta(meta):  # user reopened the project: cancel the release
+        _save_project(project_id, meta)
+    return _project_info(meta)
+
+
+@app.post("/api/projects/{project_id}/release")
+def release_project(project_id: str) -> dict:
+    """Signal that the user finished viewing this project and left.
+
+    The frontend fires this via navigator.sendBeacon when the tab closes or
+    the user navigates back to the landing page. The project (input.las,
+    output, upload sessions, job records) is deleted after a short grace
+    period unless the user re-opens it first — that keeps a processed scan
+    from hogging disk until the next upload.
+    """
+    meta = _read_project(project_id)
+    meta["release_at"] = time.time() + RELEASE_GRACE_SECONDS
+    _save_project(project_id, meta)
+    return {"released": project_id, "grace_seconds": RELEASE_GRACE_SECONDS}
 
 
 @app.post("/api/projects/{project_id}/upload", response_model=ProjectInfo)
@@ -325,11 +422,55 @@ async def upload_las(project_id: str, file: UploadFile = File(...)) -> ProjectIn
     directory = _project_dir(project_id)
     if not file.filename or not file.filename.lower().endswith((".las", ".laz")):
         raise HTTPException(status_code=400, detail="Only .las / .laz files are accepted")
+    # Stage to a temp name so a rejected upload never wipes a project's
+    # previous good input.las; publish with an atomic rename only on success.
     target = directory / "input.las"
-    with target.open("wb") as handle:
-        shutil.copyfileobj(file.file, handle)
+    staged = directory / "input.las.uploading"
+    digest = hashlib.sha256()
+    landed_size = 0
+    with staged.open("wb") as handle:
+        while True:
+            block = file.file.read(1024 * 1024)
+            if not block:
+                break
+            landed_size += len(block)
+            digest.update(block)
+            handle.write(block)
+    if landed_size == 0:
+        staged.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Upload was empty - no bytes received.")
+    # Integrity gate: a text-mangled / truncated / non-LAS body must never
+    # become <project>/input.las (that historically shipped the "Malformed LAS
+    # file: cannot fit 'int' into an offset-sized integer" processing failures).
+    # The bounded structural check runs first because laspy.open() can hang
+    # forever on a garbage VLR/EVLR count in a mangled file.
+    ok, reason = check_las_header_bounded(staged)
+    if not ok:
+        staged.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Uploaded file is not a valid LAS ({reason}). The upload was "
+                "rejected before it could corrupt the project; please re-upload "
+                "the original file."
+            ),
+        )
+    try:
+        with laspy.open(staged) as _:
+            pass
+    except Exception as exc:
+        staged.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Uploaded file is not a valid LAS ({exc}). The upload was rejected "
+                "before it could corrupt the project; please re-upload the original file."
+            ),
+        ) from exc
+    os.replace(staged, target)  # atomic publish: the previous file is intact on rejection
     meta["input_file"] = file.filename
-    meta["input_size_bytes"] = target.stat().st_size
+    meta["input_size_bytes"] = landed_size
+    meta["input_sha256"] = digest.hexdigest()
     meta["uploaded_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     meta.pop("processed", None)
     _save_project(project_id, meta)
@@ -402,12 +543,11 @@ def create_upload(project_id: str, request: UploadStartRequest) -> dict:
 
 
 @app.put("/api/projects/{project_id}/uploads/{upload_id}/part/{part_number}")
-def upload_part(project_id: str, upload_id: str, part_number: int, file: UploadFile = File(...)) -> dict:
-    """Receive one chunk (local-storage mode). Kept sync so Starlette streams
+async def upload_part(project_id: str, upload_id: str, part_number: int, file: UploadFile = File(...)) -> dict:
+    """Receive one chunk (local-storage mode). Kept async so Starlette streams
     it to disk without buffering the chunk twice in memory."""
     try:
-        data = file.file.read()
-        return upload_store.store_part(project_id, upload_id, part_number, data)
+        return await upload_store.store_part_stream_async(project_id, upload_id, part_number, file.file)
     except upload_store.UploadError as exc:
         raise _upload_error(exc) from exc
 
@@ -573,10 +713,26 @@ def _run_job(project_id: str, job_id: str, settings: ProcessingSettings) -> None
     directory = _project_dir(project_id)
     output = directory / "output"
     input_path = directory / "input.las"
-    # Fresh run: never append into a stale/partial previous output (partial tile
-    # files from a crashed earlier run would corrupt this one).
-    if output.exists():
+    # Resume a crashed run: when the previous attempt already wrote per-tile LAS
+    # files and their manifest matches this exact input file (SHA-256), keep
+    # them and skip the streaming pass. Re-streaming a multi-GB file rewrites
+    # the tiles and can 507 on a nearly full disk; resume also makes reprocess
+    # dramatically faster. Never append into a stale/partial output otherwise.
+    resume = False
+    manifest = output / "tiles" / "manifest.json"
+    if manifest.is_file():
+        try:
+            expected = json.loads(manifest.read_text(encoding="utf-8")).get("input_sha256")
+            digest = hashlib.sha256()
+            with open(input_path, "rb") as handle:
+                for block in iter(lambda: handle.read(1 << 20), b""):
+                    digest.update(block)
+            resume = bool(expected) and expected == digest.hexdigest()
+        except Exception:
+            resume = False
+    if not resume and output.exists():
         shutil.rmtree(output, ignore_errors=True)
+    settings.resume_from_tiles = resume
 
     def report(payload: dict) -> None:
         with _JOBS_LOCK:
@@ -694,6 +850,43 @@ def simulate_data(upload: UploadFile = File(...)) -> ProjectInfo:
     target = directory / "input.las"
     with target.open("wb") as handle:
         shutil.copyfileobj(upload.file, handle)
+    landed_size = target.stat().st_size if target.is_file() else 0
+    landed_sha256 = hashlib.sha256(target.read_bytes()).hexdigest() if target.is_file() else ""
+    if landed_size != upload_size:
+        target.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Data simulation write landed {landed_size} bytes but {upload_size} were sent. "
+                "The upload was corrupted; retry the upload."
+            ),
+        )
+    # Integrity gate: never run the pipeline on a text-mangled / truncated
+    # body (the "Malformed LAS" failures came from exactly that). The bounded
+    # structural check runs first because laspy.open() can hang forever on a
+    # garbage VLR/EVLR count in a mangled file.
+    ok, reason = check_las_header_bounded(target)
+    if not ok:
+        target.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Uploaded file is not a valid LAS ({reason}). The upload was "
+                "rejected before processing; please re-upload the original file."
+            ),
+        )
+    try:
+        with laspy.open(target) as _:
+            pass
+    except Exception as exc:
+        target.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Uploaded file is not a valid LAS ({exc}). The upload was rejected "
+                "before processing; please re-upload the original file."
+            ),
+        ) from exc
     settings = _web_settings()
     output = directory / "output"
     try:
@@ -705,14 +898,14 @@ def simulate_data(upload: UploadFile = File(...)) -> ProjectInfo:
         metadata = validate_las(target).metadata
     except Exception as exc:  # pragma: no cover - defensive
         raise HTTPException(status_code=500, detail=f"Data simulation failed: {exc}")
-    input_size_bytes = target.stat().st_size if target.is_file() else None
     meta = {
         "id": project_id,
         "name": f"Data Simulation · {upload.filename}",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "simulated": True,
         "input_file": upload.filename,
-        "input_size_bytes": input_size_bytes,
+        "input_size_bytes": upload_size,
+        "input_sha256": landed_sha256,
         "point_count": summary.point_count,
         "crs": summary.crs,
         "las_version": summary.las_version,
@@ -866,8 +1059,20 @@ def delete_project(project_id: str) -> dict:
     directory = _project_dir(project_id)
     if not directory.is_dir():
         raise HTTPException(status_code=404, detail="Project not found")
+    # Free the project's data AND its upload sessions (multi-GB part files)
+    # plus job records, so "delete to free storage" actually frees storage.
+    upload_store.abort_project_sessions(project_id)
+    jobs_dir = DATA_DIR / "jobs"
+    if jobs_dir.is_dir():
+        for path in jobs_dir.glob("*.json"):
+            try:
+                job = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if job.get("project_id") == project_id:
+                path.unlink(missing_ok=True)
     shutil.rmtree(directory)
-    return {"deleted": project_id}
+    return {"deleted": project_id, "freed": True}
 
 
 # Serve the built frontend last so /api/* routes always win.

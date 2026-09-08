@@ -112,6 +112,11 @@ class ProcessingSettings:
     viewer_payload_max_bytes: int = 9_000_000
     point_index_sample_limit: int = 256
     save_tiles: bool = True
+    # Resume a crashed/interrupted run from the per-tile LAS files already on
+    # disk (skips the streaming pass). Only ever honored when the tile manifest
+    # exists and its input SHA-256 matches the input file - a new upload never
+    # reuses stale tiles.
+    resume_from_tiles: bool = False
     # Uniform input thinning (LAStools las2las -thin analogue): when > 0 and the
     # input exceeds this many points, every stride-th point is kept per chunk so
     # very large files (e.g. airborne 3DEP tiles) process with bounded memory.
