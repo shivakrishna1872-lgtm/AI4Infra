@@ -73,4 +73,6 @@ def test_confidence_in_range_and_explained(synthetic_las: Path, output_dir: Path
         assert asset.confidence_explanation
         assert asset.confidence_factors.get("geometry") is not None
         assert asset.source_tile.startswith("tile_")
-        assert asset.coordinate_reference_system is None  # synthetic LAS has no CRS
+        # synthetic LAS has no CRS in its header, so the configured fallback
+        # (EPSG:6553, Mannford OK competition default) is reported instead of null
+        assert asset.coordinate_reference_system == "EPSG:6553"

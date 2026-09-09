@@ -24,37 +24,57 @@ def detect_safety(ctx: TileContext) -> List[Asset]:
 
     # ---- Guardrails + barriers (shared candidate mask) -------------------------
     rail_mask = (ctx.height >= settings.guardrail_min_height_m) & (ctx.height <= settings.guardrail_max_height_m)
+    tile_assets: List[Asset] = []
     for component in grid_components(ctx.x, ctx.y, rail_mask, settings.guardrail_resolution_m, min_cells=5):
         if len(component) < settings.guardrail_min_points:
             continue
         metrics = component_metrics(ctx.x, ctx.y, ctx.z, component)
         length = max(metrics["length_m"], metrics["width_m"])
         lateral = min(metrics["length_m"], metrics["width_m"])
+        height_m = metrics["height_m"]
 
+        aspect_ratio = max(length, lateral) / max(min(length, lateral), 1e-3)
+        is_linear = aspect_ratio >= settings.guardrail_linear_aspect_ratio
         if (
-            length >= settings.guardrail_min_length_m
+            (length >= settings.guardrail_min_length_m or is_linear)
             and lateral <= settings.guardrail_max_width_m
-            and metrics["height_m"] <= settings.guardrail_max_height_extent_m
+            and height_m <= settings.guardrail_max_height_extent_m
+            and height_m <= settings.guardrail_max_height_m
         ):
-            # Guardrail vs barrier: barrier has a wider cross-section
-            if lateral >= settings.barrier_min_width_m:
-                assets.append(_barrier_asset(ctx, component, metrics, length, lateral))
+            # Linear but compact candidate above ground height: force it into a
+            # linear safety class (guardrail vs barrier) instead of utility cabinet,
+            # even when the absolute length is under the guardrail_min_length_m gate.
+            if is_linear and lateral < settings.barrier_min_width_m:
+                asset = _guardrail_asset(ctx, component, metrics, length, lateral, aspect_ratio, height_m)
+            elif is_linear and lateral >= settings.barrier_min_width_m:
+                asset = _barrier_asset(ctx, component, metrics, length, lateral, aspect_ratio, height_m)
+            elif lateral >= settings.barrier_min_width_m:
+                asset = _barrier_asset(ctx, component, metrics, length, lateral, aspect_ratio, height_m)
             else:
-                assets.append(_guardrail_asset(ctx, component, metrics, length, lateral))
+                asset = _guardrail_asset(ctx, component, metrics, length, lateral, aspect_ratio, height_m)
+            if asset is not None:
+                # Keep the measured component metrics on the asset so the
+                # cross-tile merge pass can run its aspect/orientation checks
+                # without re-fitting anything.
+                asset._metrics = metrics  # type: ignore[attr-defined]
+                tile_assets.append(asset)
 
     # ---- Rumble strips -----------------------------------------------------------
     assets.extend(_rumble_strips(ctx))
+    assets.extend(tile_assets)
     return assets
 
 
-def _guardrail_asset(ctx: TileContext, component: np.ndarray, metrics: dict, length: float, lateral: float) -> Optional[Asset]:
+def _guardrail_asset(ctx: TileContext, component: np.ndarray, metrics: dict, length: float, lateral: float, aspect_ratio: float, height_m: float) -> Optional[Asset]:
     settings = ctx.settings
+    if height_m > settings.guardrail_max_height_m:
+        return None
     straightness = metrics["linearity"]
     elevation_band = metrics["centroid_z"] - ctx.ground
-    geometry_score = min(0.92, 0.5 + straightness * 0.3 + min(elevation_band / 1.0, 0.15))
+    geometry_score = min(0.92, 0.5 + straightness * 0.3 + min(elevation_band / 1.0, 0.15) + min(max(aspect_ratio - 2.0, 0.0) * 0.05, 0.1))
     explanation = (
         f"Long ({length:.1f} m), low, narrow ({lateral:.2f} m) roadside structure with "
-        f"straightness {straightness:.2f} matches W-beam guardrail geometry."
+        f"straightness {straightness:.2f} and aspect ratio {aspect_ratio:.1f}:1 matches W-beam guardrail geometry."
     )
     return build_asset(
         ctx,
@@ -68,19 +88,18 @@ def _guardrail_asset(ctx: TileContext, component: np.ndarray, metrics: dict, len
     )
 
 
-def _barrier_asset(ctx: TileContext, component: np.ndarray, metrics: dict, length: float, lateral: float) -> Optional[Asset]:
+def _barrier_asset(ctx: TileContext, component: np.ndarray, metrics: dict, length: float, lateral: float, aspect_ratio: float, height_m: float) -> Optional[Asset]:
     settings = ctx.settings
-    if (
-        length < settings.barrier_min_length_m
-        or lateral > settings.barrier_max_width_m
-        or metrics["height_m"] < settings.barrier_min_height_m
-        or metrics["height_m"] > settings.barrier_max_height_m
-    ):
+    if height_m < settings.barrier_min_height_m or height_m > settings.barrier_max_height_m:
         return None
-    geometry_score = min(0.9, 0.5 + metrics["linearity"] * 0.25 + min(lateral / 0.8, 0.2))
+    if lateral > settings.barrier_max_width_m:
+        return None
+    if length < settings.barrier_min_length_m and aspect_ratio < settings.guardrail_linear_aspect_ratio:
+        return None
+    geometry_score = min(0.9, 0.5 + metrics["linearity"] * 0.25 + min(lateral / 0.8, 0.2) + min(max(aspect_ratio - 2.0, 0.0) * 0.05, 0.1))
     explanation = (
         f"Continuous ({length:.1f} m) roadside structure with wide cross-section "
-        f"({lateral:.2f} m) matches concrete/Jersey barrier geometry."
+        f"({lateral:.2f} m) and aspect ratio {aspect_ratio:.1f}:1 matches concrete/Jersey barrier geometry."
     )
     return build_asset(
         ctx,

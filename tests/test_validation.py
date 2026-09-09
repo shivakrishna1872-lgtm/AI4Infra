@@ -45,8 +45,19 @@ def test_las12_warns_and_strict_fails(tmp_path: Path) -> None:
         validate_las(path, strict_las14=True)
 
 
-def test_crs_unresolved_warning(synthetic_las: Path) -> None:
-    result = validate_las(synthetic_las)
+def test_crs_fallback_warning(synthetic_las: Path) -> None:
+    """No CRS in the header + a configured fallback => CRS_FALLBACK, not unresolved."""
+    result = validate_las(synthetic_las, crs_fallback="EPSG:6553")
+    assert result.metadata.crs == "EPSG:6553"
+    assert result.metadata.crs_fallback_used is True
+    assert any(issue.code == "CRS_FALLBACK" for issue in result.issues)
+    assert not any(issue.code == "CRS_UNRESOLVED" for issue in result.issues)
+
+
+def test_crs_unresolved_warning_without_fallback(synthetic_las: Path) -> None:
+    """crs_fallback=None keeps the old never-assume behaviour."""
+    result = validate_las(synthetic_las, crs_fallback=None)
+    assert result.metadata.crs is None
     assert any(issue.code == "CRS_UNRESOLVED" for issue in result.issues)
 
 

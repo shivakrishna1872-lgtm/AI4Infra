@@ -275,6 +275,14 @@ export default function Viewer({ project, onBack }: Props) {
         <button className="tbtn" onClick={onBack}>Projects</button>
       </header>
 
+      {data.run.warnings.length > 0 && (
+        <div className="warn-strip">
+          {data.run.warnings.map((w, i) => (
+            <span key={i}>{w}</span>
+          ))}
+        </div>
+      )}
+
       {/* ---------------- main ---------------- */}
       <div className="viewer-main">
         <LayersPanel

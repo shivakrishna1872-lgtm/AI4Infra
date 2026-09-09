@@ -86,6 +86,62 @@ precision undercounts. Recall 1.000 means every real object is covered; per-row
 precision (0.02-0.33) is a conservative lower bound, and the pieces are merged /
 QC-flagged per the inventory rules.
 
+### 4a-bis. Cross-tile merge pass (spatial continuity) — measured outcome
+
+The pipeline now re-joins corridor assets that tile boundaries cut, and the
+evaluation scores them by **extent-aware matching** (a detection whose
+bounding box overlaps the GT object's inflated box belongs to that object)
+plus **fragmentation** (detections per matched GT object) instead of
+per-object precision. Measured on QuickSim seed 7 (before → after):
+
+| class | before | after | GT |
+| --- | ---: | ---: | ---: |
+| pavement | 20 fragments | **1** asset | 1 deck |
+| pavement_marking | 58 fragments | **9** marking features | 1 painted area |
+| guardrail | 5 fragments (incl. 1 mislabeled `safety_barrier`) | **2** spans | 2 rails |
+| safety_barrier | 2 fragments | **1** span | 1 barrier |
+| overhead_conductor | 5 spans | 5 spans | 5 wires |
+| utility_pole | 6 | 6 | 6 poles |
+
+Every compact class stays 1.000 P/R/F1; every area/linear class reaches
+recall 1.000 with fragmentation 1.0 for pavement/guardrails/barriers (9.0
+for markings — individual line features and dash chains, which is the honest
+inventory granularity). Fixes behind the numbers:
+
+- **Proximity-aware surface merge**: tile fragments touch at tile edges
+  (tiles are non-overlapping), so an exact hull-intersection test never
+  joined them; polygons within 1 m are now joined (the old test also had an
+  incorrect separating-axis direction and never merged anything).
+- **Line-frame linear merge for safety**: guardrail/barrier pieces are now
+  pooled and joined in the pieces' own frame (gap along heading, perpendicular
+  cross-track ≤ 1.5 m, heading dot ≥ 0.906). Previously the join axis was
+  chosen from the centre offset, so two parallel rails 10 m apart were merged
+  as one "span" while true continuations across a tile boundary were refused;
+  PCA azimuth modulo 180 (0.01° vs 179.98° for the same line) broke the
+  heading check, and poles standing 1.4-1.7 m beside a rail blocked merges
+  (pole blocking is correct for conductors, wrong for roadside safety).
+- **Span-level class resolution**: when pieces of one continuous span are
+  labeled differently (a rail tile merged with a sign footprint measures
+  0.63 m wide and is labeled `safety_barrier`), the merged span takes the
+  *median* piece cross-section — robust to one contaminated piece.
+- **Learned-veto exemption for area/linear classes**: the veto deleted that
+  0.63 m guardrail fragment outright (it did not look like a barrier); the
+  span merge fixes the label instead, so the veto now applies only to
+  compact classes.
+- **Collinear marking merge**: dashed centreline blobs ~9 m apart on the same
+  heading are re-joined into one marking line; edge-line fragments across
+  tiles join the same way.
+- **Marking brightness cut recalibrated (real-data lesson)**: the contrast
+  floor at 2.5× median routinely made the *effective* intensity threshold land
+  near the 95th percentile on bright road surfaces — the likely cause of only
+  50 marking records on the 112.8M-point Mannford corridor. The floor is now
+  configurable and set to 2.0× median with the quantile at 0.90, so the
+  effective cut sits in the 88th–90th percentile band. Measured on seed 7:
+  marking recall stays 1.000 (extent-matched) while detection count rose
+  9 → 10 pieces — strictly more sensitive, no precision loss on compact
+  classes (`marking_intensity_quantile` / `marking_*_floor_multiplier` in
+  `configs/processing.yaml`).
+
 ### 4b. Threshold tuning outcome
 
 The coordinate descent ran over every knob with a candidate range around the

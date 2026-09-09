@@ -63,7 +63,8 @@ def _merge_settings(args: argparse.Namespace) -> ProcessingSettings:
                  "pointcept_class_names", "pointcept_num_gpus", "openpcseg_root",
                  "openpcseg_config", "openpcseg_weight", "openpcseg_taxonomy",
                  "openpcseg_num_gpus", "roadmarking_command",
-                 "roadmarking_config", "max_input_points"):
+                 "roadmarking_config", "max_input_points",
+                 "learned_prior_enabled", "learned_classifier_path"):
         if name in ("tile_size", "viewer_points"):
             field = "tile_size_m" if name == "tile_size" else "viewer_point_limit"
             value = getattr(args, name, None)
@@ -76,6 +77,10 @@ def _merge_settings(args: argparse.Namespace) -> ProcessingSettings:
 
 def _process(args: argparse.Namespace) -> int:
     settings = _merge_settings(args)
+    if getattr(args, "collect_training", False):
+        settings.collect_training = True
+    if getattr(args, "no_learned_veto", False):
+        settings.learned_veto = False
     try:
         result = process_las(
             args.input, args.output, settings,
@@ -365,6 +370,13 @@ def build_parser() -> argparse.ArgumentParser:
     process.add_argument("--openpcseg-num-gpus", type=int, help="GPUs for OpenPCSeg inference")
     process.add_argument("--roadmarking-command", help="RoadMarkingExtraction run script (opt-in)")
     process.add_argument("--roadmarking-config", help="RoadMarkingExtraction parameter config")
+    process.add_argument("--no-learned-prior", dest="learned_prior_enabled", action="store_false",
+                         help="Disable the learned component classifier prior (geometry confidence only)")
+    process.add_argument("--learned-model", dest="learned_classifier_path", help="Path to a learned classifier JSON (default: configs/learned_classifier.json)")
+    process.add_argument("--no-learned-veto", dest="no_learned_veto", action="store_true",
+                         help="Keep the classifier prior but never veto candidates with it")
+    process.add_argument("--collect-training", dest="collect_training", action="store_true",
+                         help="Write labeled component features to <output>/training/ for (re)training")
     process.add_argument("--mongo-uri", help="MongoDB connection string; mirrors the inventory (or MONGO_URI env)")
     process.add_argument("--mongo-db", default="ai4infra", help="MongoDB database (default: ai4infra)")
     process.add_argument("--mongo-collection", default="assets", help="MongoDB collection (default: assets)")

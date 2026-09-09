@@ -20,7 +20,7 @@ from .errors import (
     MissingDimensionError,
     UnsupportedLasVersionError,
 )
-from .las_reader import EXPECTED_POINT_FORMAT, LAS14, read_metadata
+from .las_reader import DEFAULT_CRS_FALLBACK, EXPECTED_POINT_FORMAT, LAS14, read_metadata
 
 
 @dataclass
@@ -218,14 +218,23 @@ def check_las_header_bounded(path: str | Path) -> Tuple[bool, str]:
     return True, ""
 
 
-def validate_las(path: str | Path, strict_las14: bool = False) -> ValidationResult:
+def validate_las(
+    path: str | Path, strict_las14: bool = False,
+    crs_fallback: str | None = DEFAULT_CRS_FALLBACK,
+) -> ValidationResult:
     """Validate a LAS file against the competition expectations.
+
+    ``crs_fallback`` (e.g. ``EPSG:6553``, the Mannford OK default) is forced
+    at load time when the header carries no resolvable CRS — the laspy
+    analogue of PDAL's ``override_srs`` — and reported as a CRS_FALLBACK
+    warning instead of CRS_UNRESOLVED. ``None`` keeps the old never-assume
+    behaviour.
 
     Raises :class:`infra_inventory.errors.InfraError` subclasses for hard
     failures; returns structured issues otherwise.
     """
     path = Path(path).expanduser().resolve()
-    metadata = read_metadata(path)
+    metadata = read_metadata(path, crs_fallback=crs_fallback)
     issues: List[Issue] = []
 
     if metadata.version != LAS14:
@@ -258,6 +267,14 @@ def validate_las(path: str | Path, strict_las14: bool = False) -> ValidationResu
             "The coordinate reference system could not be resolved from LAS metadata. Outputs will report CRS_UNRESOLVED.",
             "Re-export the LAS with CRS/VLR metadata, or document the expected EPSG code manually.",
         ))
+    elif metadata.crs_fallback_used:
+        issues.append(Issue(
+            "warning", "CRS_FALLBACK",
+            f"No CRS in the LAS header; assumed {metadata.crs} (configured fallback, "
+            "laspy override_srs analogue). Distance units follow that EPSG.",
+            "Verify this is the capture's real zone; override configs/processing.yaml "
+            "crs_fallback if not.",
+        ))
     else:
         issues.append(Issue("info", "CRS", f"CRS resolved: {metadata.crs}"))
 
@@ -272,6 +289,12 @@ def validate_las(path: str | Path, strict_las14: bool = False) -> ValidationResu
             "warning", "NO_RGB",
             "The LAS has no RGB dimensions; brightness-based evidence is disabled.",
             "Re-export with RGB (format 7) if color was captured.",
+        ))
+    if metadata.has_nir:
+        issues.append(Issue(
+            "info", "NIR",
+            "Infrared (NIR) channel detected (LAS 1.4 point format 8); NIR is fused "
+            "into pavement-marking brightness evidence alongside intensity/RGB.",
         ))
     if not metadata.has_returns:
         issues.append(Issue(

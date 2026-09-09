@@ -33,6 +33,9 @@ roadmarking_config: null    # path to its parameter config
 
 # --- Validation ---
 strict_las14: false
+crs_fallback: "EPSG:6553"  # NAD83(2011) / Oklahoma North (ftUS) - Mannford, OK
+                          # competition default, forced when the LAS header has no CRS
+                          # (laspy override_srs analogue); null keeps CRS_UNRESOLVED
 
 # --- Preprocessing ---
 ground_bin_m: 2.0
@@ -44,8 +47,10 @@ min_pavement_points: 150
 marking_height_m: 0.35
 marking_resolution_m: 0.25
 marking_min_points: 20
-marking_intensity_quantile: 0.86
-marking_brightness_quantile: 0.86
+marking_intensity_quantile: 0.90   # effective threshold ~88th-90th percentile
+marking_brightness_quantile: 0.90
+marking_intensity_floor_multiplier: 2.0  # contrast floor = x * median (kept modest so
+marking_brightness_floor_multiplier: 1.6 # the quantile binds, not a ~95th-percentile cut)
 lane_line_min_length_m: 2.0
 lane_line_max_width_m: 0.6
 stop_line_min_width_m: 1.0

@@ -179,32 +179,21 @@ export default function Landing({ onOpen }: Props) {
   const [submitted, setSubmitted] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
-  const refresh = useCallback(async () => {
-    try {
-      setProjects(await api.listProjects());
-    } catch {
-      /* server starting */
-    }
-  }, []);
-
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
-
-  useEffect(() => {
-    (async () => {
-      try {
-        const health = await api.health();
-        setEnvCheck(health?.status === "ok" ? "ok" : "no");
-      } catch {
-        setEnvCheck("no");
-      }
-    })();
-  }, []);
-
+  // Drop always into a fresh project so the browser does not attempt to start
+  // a project name with a space-that-looks-like-a-dash and then fail to parse
+  // the resulting URL path.
   const runFile = useCallback(
     (file: File) => {
-      const name = file.name.replace(/\.(las|laz)$/i, "");
+      const raw = file.name.replace(/\.(las|laz)$/i, "");
+      // Collapse any run of non-alphanumeric characters into a single dash,
+      // strip leading/trailing separators — produces names like
+      // mannford_run02_laserright instead of mangled ones with double spaces.
+      const name = raw
+        .trim()
+        .replace(/[^A-Za-z0-9_-]+/g, "_")
+        .replace(/^[-_]+|[-_]+$/g, "")
+        .slice(0, 80) || "scan";
+
       setBusy(`Uploading ${file.name}…`);
       setError(null);
       setSubmitted(false);
@@ -273,6 +262,29 @@ export default function Landing({ onOpen }: Props) {
     },
     [onOpen]
   );
+
+  const refresh = useCallback(async () => {
+    try {
+      setProjects(await api.listProjects());
+    } catch {
+      /* server starting */
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const health = await api.health();
+        setEnvCheck(health?.status === "ok" ? "ok" : "no");
+      } catch {
+        setEnvCheck("no");
+      }
+    })();
+  }, []);
 
   return (
     <div className="landing">
@@ -542,39 +554,49 @@ export default function Landing({ onOpen }: Props) {
       {/* ---------- previous projects ---------- */}
       <section className="projects">
         <Reveal>
-          <h2>Previous projects</h2>
-          {projects.length === 0 && (
+          <div className="land-data-h">
+            <h2 className="section-eyebrow">PROJECTS</h2>
+            <h3>Processed scans and simulations</h3>
+            <p className="section-sub">
+              Each scan is archived here until you finish viewing and close the
+              tab — finished scans are released so storage stays free.
+            </p>
+          </div>
+          {projects.length === 0 ? (
             <div className="empty-projects">
               No projects yet. Upload a dataset or open the simulation.
             </div>
-          )}
-          {projects.map((p) => (
-            <div
-              key={p.id}
-              className="project-row"
-              onClick={() => void openExisting(p)}
-            >
-              <div className="pname">
-                {p.simulated ? (
-                  <span className="sim-badge" style={{ marginRight: 8 }}>
-                    SIM
-                  </span>
-                ) : p.point_count && p.point_count > 0 ? (
-                  <span className="badge dev">DEV</span>
-                ) : (
-                  <span className="badge comp">COMP</span>
-                )}
-                {p.name}
-              </div>
-              <div className="pmeta">
-                {p.input_file ? formatBytes(p.input_size_bytes ?? 0) : ""}
-                {p.input_file ? ` · ${p.input_file}` : ""}
-                {p.point_count ? ` · ${p.point_count.toLocaleString()} pts` : ""}
-                {p.asset_count != null ? ` · ${p.asset_count} assets` : ""}
-                {p.processed ? " · processed" : " · pending"}
-              </div>
+          ) : (
+            <div className="project-list">
+              {projects.map((p) => (
+                <button
+                  key={p.id}
+                  className="project-row"
+                  onClick={() => void openExisting(p)}
+                >
+                  <div className="pname">
+                    {p.simulated ? (
+                      <span className="sim-badge" style={{ marginRight: 8 }}>
+                        SIM
+                      </span>
+                    ) : p.point_count && p.point_count > 0 ? (
+                      <span className="badge dev">DEV</span>
+                    ) : (
+                      <span className="badge comp">COMP</span>
+                    )}
+                    {p.name}
+                  </div>
+                  <div className="pmeta">
+                    {p.input_file ? formatBytes(p.input_size_bytes ?? 0) : ""}
+                    {p.input_file ? ` · ${p.input_file}` : ""}
+                    {p.point_count ? ` · ${p.point_count.toLocaleString()} pts` : ""}
+                    {p.asset_count != null ? ` · ${p.asset_count} assets` : ""}
+                    {p.processed ? " · processed" : " · pending"}
+                  </div>
+                </button>
+              ))}
             </div>
-          ))}
+          )}
         </Reveal>
       </section>
 

@@ -55,6 +55,40 @@ class TileContext:
     sample_stride: int  # viewer sampling stride (global)
     viewer_limit: int
     pavement_mask: Optional[np.ndarray] = None
+    # Learned component classifier (loaded once per run; None = geometry-only).
+    # Declared last because it defaults while earlier fields do not.
+    classifier: Optional[object] = None
+    # Infrared channel (LAS 1.4 point format 8); fused into marking brightness.
+    nir: Optional[np.ndarray] = None
+
+
+#: Classes whose class label is resolved at span level (merged across tiles)
+#: and whose per-tile class assignment is legitimately ambiguous (a rail vs a
+#: barrier by cross-section, a deck vs shoulders by extent). The learned veto
+#: never applies to them: a confident "wrong" class here is fixed by the merge
+#: pass, not by deleting the detection (measured on QuickSim: a guardrail tile
+#: measured 0.63 m wide, was labeled safety_barrier, and the veto deleted a
+#: true positive).
+_VETO_EXEMPT_CLASSES = frozenset({"pavement", "pavement_marking", "guardrail", "safety_barrier"})
+
+
+def _signal_alive(values: Optional[np.ndarray], base: np.ndarray) -> bool:
+    """True when a radiometric channel carries real signal on the near-ground set.
+
+    LAS exporters sometimes keep a channel's dimension but never fill it (a
+    "no-color" export leaves RGB at zeros; some scans write intensity as zeros).
+    An all-zero channel must never vote "bright": with floor = quantile = 0,
+    every near-ground point would pass and the whole road would merge into one
+    giant marking blob. A channel is alive when it has a meaningful share of
+    positive values with a positive maximum.
+    """
+    if values is None or not len(values) or not base.any():
+        return False
+    v = np.asarray(values, dtype=np.float64)[base]
+    v = v[np.isfinite(v)]
+    if not len(v) or float(v.max()) <= 0.0:
+        return False
+    return float((v > 0).mean()) >= 0.01
 
 
 def bright_near_ground_mask(ctx: TileContext, height_max: float) -> np.ndarray:
@@ -67,19 +101,41 @@ def bright_near_ground_mask(ctx: TileContext, height_max: float) -> np.ndarray:
     """
     settings = ctx.settings
     base = ctx.height <= height_max
-    if not len(ctx.intensity):
+    # No intensity channel, or no near-ground points at all (a tile whose points
+    # all sit above ``height_max`` — elevated decks, upper structure tiles): no
+    # marking evidence exists, so return an all-False mask instead of letting
+    # np.quantile crash on an empty selection.
+    if not len(ctx.intensity) or not base.any():
         return np.zeros(len(ctx.x), dtype=bool)
+    bright = np.zeros(len(ctx.x), dtype=bool)
+    # Each channel votes independently, and only when it carries real signal.
+    # A channel that exists but is all zeros (no-color exports, unfilled
+    # intensity) is ignored instead of marking every near-ground point bright
+    # (floor = quantile = 0 would pass everything).
+    #
     # Relative-contrast floor: a marking is *brighter than its surroundings*, not
     # merely in the upper tail. Without this, the bright tail of road/ground
     # reflectivity merges into real markings and pollutes their components.
-    intensity_floor = 2.5 * float(np.median(ctx.intensity[base])) if base.any() else 0.0
-    intensity_quantile = float(np.quantile(ctx.intensity[base], settings.marking_intensity_quantile))
-    bright = ctx.intensity >= max(intensity_floor, intensity_quantile)
-    if ctx.rgb is not None and base.any():
+    # The floor multiplier is deliberately modest (2.0x/1.6x median, configurable)
+    # so the effective threshold lands at the configured quantile (0.90 = the
+    # 88th-90th percentile band) instead of drifting to ~95th on bright asphalt,
+    # which starved real markings (measured: 50 records on the 112.8M-point
+    # Mannford corridor at the old 2.5x floor; docs/ACCURACY_REPORT.md §4a).
+    if _signal_alive(ctx.intensity, base):
+        intensity_floor = settings.marking_intensity_floor_multiplier * float(np.median(ctx.intensity[base]))
+        intensity_quantile = float(np.quantile(ctx.intensity[base], settings.marking_intensity_quantile))
+        bright |= ctx.intensity >= max(intensity_floor, intensity_quantile)
+    if _signal_alive(ctx.rgb.mean(axis=1) if ctx.rgb is not None else None, base):
         brightness = ctx.rgb.mean(axis=1)
-        brightness_floor = 1.8 * float(np.median(brightness[base]))
+        brightness_floor = settings.marking_brightness_floor_multiplier * float(np.median(brightness[base]))
         brightness_quantile = float(np.quantile(brightness[base], settings.marking_brightness_quantile))
         bright |= brightness >= max(brightness_floor, brightness_quantile)
+    if _signal_alive(ctx.nir, base):
+        # Infrared (LAS 1.4 point format 8) is the strongest road-paint
+        # discriminator on mobile LiDAR; same quantile/floor policy as intensity.
+        nir_floor = settings.marking_intensity_floor_multiplier * float(np.median(ctx.nir[base]))
+        nir_quantile = float(np.quantile(ctx.nir[base], settings.marking_intensity_quantile))
+        bright |= ctx.nir >= max(nir_floor, nir_quantile)
     # Exclude points inside tall structures (pole bases, posts) via cell z-range
     from ..preprocessing import cell_z_ranges
 
@@ -194,10 +250,56 @@ def build_asset(
         "height_m": round(metrics["height_m"], 3),
     }
     model_factor: Optional[float] = None
+    prior_class_name: Optional[str] = None
     if ctx.model_class is not None and model_target_classes:
         model_factor = model_factor_from_prior(
             ctx.model_class[mask], ctx.class_names, ctx.mapping, model_target_classes
         )
+    # Training-data collection: record every candidate component's features
+    # with the detector's label (relabeled against ground truth by the training
+    # script). Independent of the classifier so collection works pre-training.
+    if getattr(ctx.settings, "collect_training", False):
+        from ..learned import collect_component_example
+        collect_component_example(ctx, asset_class, mask, ctx.ground)
+    # Learned component classifier (CPU prior): scores this component's measured
+    # features against its assigned class. Fills the `model` factor when no
+    # Pointcept/OpenPCSeg prior is present, and can veto candidates the trained
+    # model confidently rejects (the geometry gates still ran first).
+    if ctx.classifier is not None:
+        from ..learned import component_features, learned_prior_factor
+        features, _extras = component_features(
+            ctx.x, ctx.y, ctx.z, mask, ctx.intensity, ctx.rgb, ctx.ground,
+        )
+        scores = ctx.classifier.scores(features)
+        factor, learned_name = learned_prior_factor(
+            ctx.classifier, asset_class, features, scores=scores,
+        )
+        if model_factor is None:
+            model_factor = factor
+            if learned_name is not None:
+                # Provenance: the classifier's own best class; `*` marks agreement.
+                prior_class_name = f"{learned_name}*" if learned_name == asset_class else learned_name
+        s = ctx.settings
+        # Veto purely on the trained model's own scores: the classifier rejects
+        # this component's assigned class with high confidence AND a concrete
+        # alternative. Independent of which prior filled `model_factor`, so a
+        # strong Pointcept prior can never mask a learned rejection.
+        #
+        # Area/linear classes are exempt: a guardrail fragment can legitimately
+        # measure wider than its neighbours (merged with a sign or pole
+        # footprint) and be labeled safety_barrier while the rest of the span
+        # is guardrail - the span-level merge resolves that, so vetoing the
+        # fragment deletes a true positive. Compact classes keep the veto.
+        if (
+            s.learned_veto
+            and asset_class not in _VETO_EXEMPT_CLASSES
+            and scores.get(asset_class, 0.0) < s.learned_veto_margin
+            and max((p for c, p in scores.items() if c != asset_class), default=0.0)
+            >= s.learned_veto_runner_margin
+        ):
+            return None  # vetoed: the trained model confidently rejects this class
+        if getattr(s, "collect_training", False):
+            collect_component_example(ctx, asset_class, mask, ctx.ground)
     support = support_score(len(mask), ctx.settings.min_asset_points, ctx.settings.max_support_points)
     consistency = class_consistency(asset_class, ctx.intensity[mask], ctx.rgb[mask] if ctx.rgb is not None else None)
     proximity = road_proximity_m(ctx, mask) if asset_class in ("guardrail", "safety_barrier", "pavement_marking", "rumble_strip", "pavement", "traffic_sign") else None
@@ -214,8 +316,7 @@ def build_asset(
 
     source_id, scanner = scanner_label(ctx.point_source_id, mask)
     run = run_label(ctx.gps_labels, mask)
-    prior_class_name: Optional[str] = None
-    if ctx.model_class is not None and ctx.class_names and model_factor is not None:
+    if prior_class_name is None and ctx.model_class is not None and ctx.class_names and model_factor is not None:
         ids = ctx.model_class[mask]
         present = [ctx.class_names[i] for i in np.unique(ids) if 0 <= i < len(ctx.class_names)]
         if present:

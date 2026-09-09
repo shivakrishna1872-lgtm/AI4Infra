@@ -111,11 +111,12 @@ machine. See [`docs/upstream-integration.md`](docs/upstream-integration.md) and
 
 | Stage | Implementation |
 | --- | --- |
-| LAS ingestion | Streaming chunks through `laspy` (`lazrs` LASzip codec for `.laz`, LAStools-style); legacy LAS 1.0/1.1 inputs are re-versioned for tile writes, never modified; optional uniform thinning (`--max-input-points`) for huge airborne tiles |
+| LAS ingestion | Streaming chunks through `laspy` (`lazrs` LASzip codec for `.laz`, LAStools-style); legacy LAS 1.0/1.1 inputs are re-versioned for tile writes, never modified; optional uniform thinning (`--max-input-points`) for huge airborne tiles; format-8 NIR read natively and fused into marking evidence; all-zero intensity/RGB channels detected and reported (`INTENSITY_DEAD` / `RGB_DEAD`) instead of flooding the marking detector |
 | Validation | LAS version / point format / CRS / dimensions / bounds, with fix hints (`validate` command) |
-| CRS | Read from LAS metadata (`EPSG:XXXX`); `CRS_UNRESOLVED` when absent — never assumed |
+| CRS | Read from LAS metadata (`EPSG:XXXX`); when the header has none, the configured fallback (default `EPSG:6553`, the Mannford OK zone) is forced at load time and reported as a `CRS_FALLBACK` warning — `crs_fallback: null` restores the never-assume `CRS_UNRESOLVED` behaviour |
 | Tiling | Spatial tiles persisted as per-tile LAS files (append mode, single pass) |
 | Ground estimation | Robust per-tile ground from cell minima; height above ground per point |
+| Learned classifier | Trained CPU prior over measured component features fills the `model` confidence factor (no GPU needed; see [`docs/LEARNED_CLASSIFIER.md`](docs/LEARNED_CLASSIFIER.md)) |
 | Pavement | Travelled surface (elevation + coverage) and painted markings (near-ground high-reflectance/brightness connected components), subclasses: lane/edge line, stop line, crosswalk, symbol |
 | Utilities | Poles (narrow footprint + vertical extent + columnarity), overhead conductors (elevated thin linear chains, heuristic), cabinets (compact dense boxes) |
 | Signs | Planar panels (eigenvalue geometry) grouped with their vertical support into one asset |
@@ -199,6 +200,16 @@ radiometry; agreement/disagreement adjusts the `model` confidence factor, and
 disagreements land in the human-review queue — the geometry detectors always
 remain the gate. `scripts/train_gemini.py` measures the boost against the
 QuickSim ground truth (see [`docs/GEMINI.md`](docs/GEMINI.md)).
+
+### Built-in learned classifier (no GPU, no data)
+
+Between the geometry backend and the GPU backends sits a trained component
+classifier (pure numpy; trained by `scripts/train_classifier.py` on labeled
+Quick-Simulation ground truth with extent-aware relabeling). It fills the
+`model` confidence factor on every asset and can veto candidates it
+confidently rejects. Measured held-out A/B: precision 0.219 → 0.221 with
+recall identical (one false positive vetoed, nothing correct removed).
+See [`docs/LEARNED_CLASSIFIER.md`](docs/LEARNED_CLASSIFIER.md).
 
 GPU notes: PTv3 requires CUDA and Pointcept's CUDA ops. FlashAttention is **optional**
 upstream — configure `enable_flash=False` and smaller patch sizes on non-compatible

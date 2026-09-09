@@ -39,12 +39,26 @@ published SHA-256. Sources and licensing: `docs/MODEL_NOTES.md`.
 ## 4. LAS preparation
 
 * Expected: **LAS 1.4, Point Data Record Format 7** (Trimble MX9 mobile LiDAR, as
-  provided by the competition).
+  provided by the competition). **Point format 8** (adds the native infrared
+  `nir` channel) is read natively too: the NIR channel is fused into
+  pavement-marking brightness evidence alongside intensity/RGB.
 * The file should carry intensity, RGB, `gps_time` (run separation) and
   `point_source_id` (scanner attribution) when available.
+* **Dead radiometric channels are detected, not guessed**: an exporter that
+  keeps the RGB/intensity dimensions but never fills them (e.g. a "no-color"
+  export) would otherwise look like "everything is bright" to the marking
+  detector. The streaming pass reports `[INTENSITY_DEAD]` / `[RGB_DEAD]` in
+  `run.json` warnings, and the detector ignores an all-zero channel per tile,
+  so markings are extracted from the channels that actually carry signal.
 * If your LAS is an older version or a different point format, re-export with
   CloudCompare or laspy; the pipeline degrades gracefully but the competition source
   is LAS 1.4 / format 7.
+* **CRS is forced at load time**: when the header carries no resolvable CRS, the
+  reader applies the configured fallback (the laspy analogue of PDAL's
+  `override_srs`): `EPSG:6553` (NAD83(2011) / Oklahoma North, **US survey feet** —
+  the Mannford, OK zone), and validation reports a `CRS_FALLBACK` warning so
+  distance units stay consistent instead of drifting. Set `crs_fallback: null` in
+  `configs/processing.yaml` to restore the never-assume `CRS_UNRESOLVED` behaviour.
 
 Validate before processing:
 
@@ -271,6 +285,24 @@ python scripts/calibrate_confidence.py --length 400 --seed 23 --report reports/c
 Set `review_confidence_threshold` in `configs/processing.yaml` to the
 recommended value and record the sweep in docs/ALP.md.
 
+## 15c-bis. Retraining the learned classifier
+
+The CPU path ships with a trained component classifier that fills the `model`
+confidence factor (see [`docs/LEARNED_CLASSIFIER.md`](LEARNED_CLASSIFIER.md)).
+Retrain it after changing detectors or the feature set:
+
+```bash
+python scripts/train_classifier.py                    # train + held-out eval + save
+python scripts/train_classifier.py --dry-run          # measure the current config only
+```
+
+It runs Quick Simulation scenes with `--collect-training`, relabels every
+candidate component against the exact ground truth (extent-aware matching),
+trains the softmax model, reports train/held-out accuracy and per-class
+P/R/F1, and writes `configs/learned_classifier.json` with the metrics
+embedded. Per-run controls: `--no-learned-prior`, `--no-learned-veto`,
+`--learned-model <path>`, `--collect-training`.
+
 ## 15c. Disk space and very large files
 
 A ~16M-point tile needs several GB for per-tile intermediates. Three lines of
@@ -294,6 +326,37 @@ rm -f appdata/jobs/*.tmp     # leftover atomic-write temp files
 
 Delete old projects from the web UI (project → delete) before reprocessing big
 files. Never commit `.las`/`.laz` datasets.
+
+## 15d. Measured throughput (this build)
+
+Measured in-sandbox on a 210,226-point / 42-tile LAS 1.4 corridor through the
+real API (upload → job → viewer payload):
+
+| stage | measured | note |
+| --- | ---: | --- |
+| upload (resumable chunked / simple) | **161-377 MB/s** | local disk; direct-to-S3 presign avoids the app server entirely for multi-GB files |
+| full analysis (210 k pts, 42 tiles) | **3.2 s** (~65 k pts/s) | includes SHA-256 resume check, worker-pool detection, merge passes, QC, ALP, exports; ~1.2 s is pure `process_las` |
+| per-tile detection pass | parallel across worker processes | 42 tiles over the sandbox's cores |
+
+Biggest recent wins (all verified identical-output before/after on the same
+file): per-asset convex-hull caching in the surface merge (hull building was
+78% of pipeline time; now cached per asset — **4.7×**), vectorized
+`_elevation_color` (**3×** on its own), fast `Asset.to_dict` (35% of export
+cost on a 1.1 M-point profile), a prefiltered nearest-highlight search for
+viewer point labels, and the streaming pass: the LAS header is now read once
+per run instead of once per chunk (laspy re-opens were O(chunks)), the
+writable tile header is built once and cached per source header instead of per
+(chunk × tile) append, and the GPS-run k-means samples to 50k points instead
+of running 40 passes over every 500k-point chunk. Streaming a 193k-point
+corridor to 40 tiles now completes in **0.44 s**. The remaining hotspots
+(point-label search, JSON export) are bounded by the viewer LOD caps
+(`viewer_point_limit`, `viewer_payload_max_bytes`), so they do not grow with
+file size.
+
+The web path deliberately raises the viewer LOD budget to 250 k points for a
+finer 3D preview; the CLI default is 120 k. Lower `viewer_point_limit` in
+`configs/processing.yaml` when the browser payload matters more than preview
+detail.
 
 ## Known limitations (read before judging)
 

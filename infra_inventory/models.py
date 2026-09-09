@@ -1,8 +1,10 @@
 """Core data model: assets, settings, run summaries, and shared types."""
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Dict, List, Optional, Tuple
+
+from .las_reader import DEFAULT_CRS_FALLBACK
 
 #: (min_x, min_y, min_z, max_x, max_y, max_z)
 Bounds = Tuple[float, float, float, float, float, float]
@@ -85,7 +87,18 @@ class Asset:
     assessment_reasoning: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        result = asdict(self)
+        # Fast serialization: ``dataclasses.asdict`` deep-copies every nested
+        # list/dict recursively, which dominates export time on large runs
+        # (35% of total pipeline time on a 1.1M-point profile). One-level
+        # copies give the same isolation guarantees serialization consumers
+        # need at a fraction of the cost. Field list is derived from the
+        # dataclass so new fields are picked up automatically.
+        result = {f.name: getattr(self, f.name) for f in fields(self)}
+        for name, value in result.items():
+            if isinstance(value, list):
+                result[name] = list(value)
+            elif isinstance(value, dict):
+                result[name] = dict(value)
         result["class"] = result.pop("asset_class")
         return result
 
@@ -154,8 +167,29 @@ class ProcessingSettings:
     roadmarking_command: Optional[str] = None
     roadmarking_config: Optional[str] = None
 
+    # --- Learned component classifier (CPU prior) ---
+    # Trained softmax classifier over measured component features, shipped at
+    # configs/learned_classifier.json. Fills the `model` confidence factor on
+    # runs without a Pointcept/OpenPCSeg prior; a Pointcept/OpenPCSeg prior
+    # always wins when present. `learned_veto` additionally drops candidates
+    # the classifier rejects with high confidence.
+    learned_prior_enabled: bool = True
+    learned_classifier_path: Optional[str] = None
+    learned_veto: bool = True
+    learned_veto_margin: float = 0.60  # P(assigned) below this ...
+    learned_veto_runner_margin: float = 0.20  # ... AND runner-up above this
+    # Training-data collection (writes <output>/training/components_*.jsonl).
+    # Never a schema/API field: set programmatically by --collect-training.
+    collect_training: bool = False
+
     # --- Validation ---
     strict_las14: bool = False
+    # CRS fallback forced at load time when the LAS header carries no resolvable
+    # CRS (the reader's override_srs analogue): the Trimble MX9 Mannford, OK
+    # capture is NAD83(2011) / Oklahoma North, US survey feet = EPSG:6553
+    # (docs/PROCEDURE.md §4). None keeps the old CRS_UNRESOLVED behaviour
+    # (report unknown, never assume).
+    crs_fallback: Optional[str] = DEFAULT_CRS_FALLBACK
 
     # --- Preprocessing ---
     ground_bin_m: float = 2.0
@@ -167,8 +201,16 @@ class ProcessingSettings:
     marking_height_m: float = 0.35
     marking_resolution_m: float = 0.25
     marking_min_points: int = 20
-    marking_intensity_quantile: float = 0.86
-    marking_brightness_quantile: float = 0.86
+    # Marking brightness cutoffs. The quantile alone is not the effective
+    # threshold: the contrast floor (``x * median``) also gates, and a floor at
+    # 2.5x median routinely landed the effective cut near the 95th percentile
+    # on bright road surfaces, starving markings. 0.90 + a 2.0x floor keeps the
+    # effective threshold in the 88th-90th percentile band (docs/ACCURACY_REPORT.md
+    # §4a) while the floor still blocks uniformly-bright ground planes.
+    marking_intensity_quantile: float = 0.90
+    marking_brightness_quantile: float = 0.90
+    marking_intensity_floor_multiplier: float = 2.0
+    marking_brightness_floor_multiplier: float = 1.6
     lane_line_min_length_m: float = 2.0
     lane_line_max_width_m: float = 0.6
     stop_line_min_width_m: float = 1.0
@@ -219,6 +261,8 @@ class ProcessingSettings:
     guardrail_max_height_extent_m: float = 1.8
     guardrail_min_points: int = 60
     guardrail_resolution_m: float = 0.5
+    guardrail_linear_aspect_ratio: float = 4.0
+    guardrail_linear_overlap_m: float = 3.0
     barrier_min_length_m: float = 8.0
     barrier_min_width_m: float = 0.35
     barrier_max_width_m: float = 1.4

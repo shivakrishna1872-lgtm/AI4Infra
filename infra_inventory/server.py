@@ -78,6 +78,9 @@ def _write_job(job: dict) -> None:
 #: multi-GB tiles to DATA_DIR, so starting one on a nearly full disk just turns
 #: into a crash mid-way; we fail fast with a clear message instead.
 MIN_FREE_DISK_BYTES = 512 * 1024 * 1024
+# Slimmest possible prompt data the viewer needs. Keeping this low leaves room
+# for real .las/.laz uploads while still letting the 3D scene open.
+MIN_VIEWER_BYTES = 64 * 1024 * 1024
 
 
 def _free_disk_bytes() -> int:
@@ -144,15 +147,16 @@ def _disk_full_message() -> str:
     )
 
 
-def _ensure_disk_headroom() -> None:
+def _ensure_disk_headroom(min_free: int = MIN_FREE_DISK_BYTES) -> None:
     """Fail fast with a clear 507 instead of crashing mid-write with Errno 28.
 
     Projects the user has finished viewing ("released" via the frontend beacon
     when they close the tab) are pruned first, so an upload/process retry
-    frees its own space instead of hitting 507."""
+    frees its own space instead of hitting 507.
+    """
     _prune_released()
     free = _free_disk_bytes()
-    if free < MIN_FREE_DISK_BYTES:
+    if free < min_free:
         raise HTTPException(
             status_code=507,
             detail=_disk_full_message(),
@@ -1081,7 +1085,14 @@ if WEB_DIST.is_dir():
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    """Run the server with uvicorn (if installed)."""
+    """Run the inspection platform with uvicorn (if installed).
+
+    Binds to 0.0.0.0 and honors the injected PORT (cloud previews), but falls
+    back to :8766 so a local `python -m infra_inventory app` still starts even
+    when PORT is unset. On a crash we print the traceback and exit with 3 so
+    the caller knows the server died mid-request rather than appearing to be
+    fine and then returning 502 on every request.
+    """
     import os
     import sys
 
@@ -1103,7 +1114,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             pass
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     print(f"AI4Infra API: http://{host}:{port}  (data: {DATA_DIR})", flush=True)
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    try:
+        uvicorn.run(app, host=host, port=port, log_level="warning")
+    except Exception as exc:  # noqa: BLE001 - last-resort crash reporter
+        print(f"AI4Infra API crashed: {exc}", file=sys.stderr, flush=True)
+        return 3
     return 0
 
 

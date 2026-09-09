@@ -3,8 +3,9 @@
 Never loads an entire LAS file into memory: points are consumed in chunks of
 ``chunk_size`` through laspy's chunk iterator. The competition source is LAS 1.4
 / Point Data Record Format 7 (Trimble MX9, two scanner heads), so the reader
-also surfaces ``gps_time`` (run separation) and ``point_source_id`` (scanner
-attribution) whenever the file exposes them.
+also surfaces ``gps_time`` (run separation), ``point_source_id`` (scanner
+attribution) and the format-8 ``nir`` infrared channel whenever the file
+exposes them.
 """
 from __future__ import annotations
 
@@ -32,6 +33,13 @@ def _laz_backend_error(exc: Exception) -> bool:
 LAS14 = "1.4"
 EXPECTED_POINT_FORMAT = 7
 
+#: CRS forced at load time when the LAS header carries no resolvable CRS (the
+#: laspy analogue of PDAL's ``override_srs``). The competition source is a
+#: Trimble MX9 capture at Mannford, Oklahoma in NAD83(2011) / Oklahoma North,
+#: US survey feet = EPSG:6553 — the zone/units that make height and width
+#: thresholds (metres) trustworthy instead of silently drifting.
+DEFAULT_CRS_FALLBACK = "EPSG:6553"
+
 
 @dataclass
 class LasMetadata:
@@ -44,11 +52,13 @@ class LasMetadata:
     offsets: Tuple[float, float, float]
     has_intensity: bool
     has_rgb: bool
+    has_nir: bool
     has_returns: bool
     has_gps_time: bool
     has_point_source_id: bool
     has_classification: bool
     bounds: Tuple[float, float, float, float, float, float]
+    crs_fallback_used: bool = False  # True when crs came from the fallback, not the header
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -61,11 +71,13 @@ class LasMetadata:
             "offsets": list(self.offsets),
             "has_intensity": self.has_intensity,
             "has_rgb": self.has_rgb,
+            "has_nir": self.has_nir,
             "has_returns": self.has_returns,
             "has_gps_time": self.has_gps_time,
             "has_point_source_id": self.has_point_source_id,
             "has_classification": self.has_classification,
             "bounds": list(self.bounds),
+            "crs_fallback_used": self.crs_fallback_used,
         }
 
 
@@ -84,6 +96,7 @@ class LasChunk:
     point_source_id: Optional[np.ndarray]
     classification: Optional[np.ndarray]
     global_offset: int  # first global point index of this chunk
+    nir: Optional[np.ndarray] = None  # infrared (LAS 1.4 point format 8 only)
 
 
 def parse_crs(reader: laspy.LasReader) -> Optional[str]:
@@ -98,35 +111,54 @@ def parse_crs(reader: laspy.LasReader) -> Optional[str]:
         return None
 
 
-def read_metadata(path: str | Path) -> LasMetadata:
+def _metadata_from_reader(reader: laspy.LasReader, path: Path, crs_fallback: Optional[str]) -> LasMetadata:
+    """Extract metadata from an already-open reader (no extra file open)."""
+    header = reader.header
+    names = set(header.point_format.dimension_names)
+    version = f"{header.version.major}.{header.version.minor}"
+    bounds = (
+        float(header.mins[0]), float(header.mins[1]), float(header.mins[2]),
+        float(header.maxs[0]), float(header.maxs[1]), float(header.maxs[2]),
+    )
+    crs = parse_crs(reader)
+    fallback_used = False
+    if crs is None and crs_fallback:
+        crs = crs_fallback
+        fallback_used = True
+    return LasMetadata(
+        path=str(path),
+        version=version,
+        point_format=int(header.point_format.id),
+        point_count=int(header.point_count),
+        crs=crs,
+        scales=tuple(float(v) for v in header.scales),
+        offsets=tuple(float(v) for v in header.offsets),
+        has_intensity="intensity" in names,
+        has_rgb={"red", "green", "blue"}.issubset(names),
+        has_nir="nir" in names,
+        has_returns={"return_number", "number_of_returns"}.issubset(names),
+        has_gps_time="gps_time" in names,
+        has_point_source_id="point_source_id" in names,
+        has_classification="classification" in names,
+        bounds=bounds,
+        crs_fallback_used=fallback_used,
+    )
+
+
+def read_metadata(path: str | Path, crs_fallback: Optional[str] = DEFAULT_CRS_FALLBACK) -> LasMetadata:
+    """Read header-only metadata.
+
+    ``crs_fallback`` is applied when the header has no resolvable CRS (the
+    laspy analogue of PDAL's ``override_srs``); pass ``None`` to report the
+    CRS as unknown instead. ``LasMetadata.crs_fallback_used`` records which
+    happened so callers can warn honestly.
+    """
     path = Path(path).expanduser().resolve()
     if not path.is_file():
         raise InputNotFoundError(str(path))
     try:
         with laspy.open(path) as reader:
-            header = reader.header
-            names = set(header.point_format.dimension_names)
-            version = f"{header.version.major}.{header.version.minor}"
-            bounds = (
-                float(header.mins[0]), float(header.mins[1]), float(header.mins[2]),
-                float(header.maxs[0]), float(header.maxs[1]), float(header.maxs[2]),
-            )
-            return LasMetadata(
-                path=str(path),
-                version=version,
-                point_format=int(header.point_format.id),
-                point_count=int(header.point_count),
-                crs=parse_crs(reader),
-                scales=tuple(float(v) for v in header.scales),
-                offsets=tuple(float(v) for v in header.offsets),
-                has_intensity="intensity" in names,
-                has_rgb={"red", "green", "blue"}.issubset(names),
-                has_returns={"return_number", "number_of_returns"}.issubset(names),
-                has_gps_time="gps_time" in names,
-                has_point_source_id="point_source_id" in names,
-                has_classification="classification" in names,
-                bounds=bounds,
-            )
+            return _metadata_from_reader(reader, path, crs_fallback)
     except EmptyPointCloudError:
         raise
     except LazBackendMissingError:
@@ -154,7 +186,10 @@ def iter_chunks(path: str | Path, chunk_size: int, stride: int = 1) -> Iterator[
         raise InputNotFoundError(str(path))
     try:
         with laspy.open(path) as reader:
-            metadata = read_metadata(path)
+            # Header read once from the already-open reader (previously
+            # read_metadata re-opened the file on every chunk — on a 1000-chunk
+            # 4 GB file that was 1000 redundant header parses).
+            metadata = _metadata_from_reader(reader, path, DEFAULT_CRS_FALLBACK)
             if metadata.point_count == 0:
                 raise EmptyPointCloudError()
             global_offset = 0
@@ -183,12 +218,14 @@ def iter_chunks(path: str | Path, chunk_size: int, stride: int = 1) -> Iterator[
                         np.asarray(raw_chunk.green, dtype=np.float64),
                         np.asarray(raw_chunk.blue, dtype=np.float64),
                     ))
+                nir = np.asarray(raw_chunk.nir, dtype=np.float64) if "nir" in names else None
                 chunk = LasChunk(
                     x=x,
                     y=y,
                     z=z,
                     intensity=intensity,
                     rgb=rgb,
+                    nir=nir,
                     return_number=(np.asarray(raw_chunk.return_number, dtype=np.int64) if "return_number" in names else None),
                     number_of_returns=(np.asarray(raw_chunk.number_of_returns, dtype=np.int64) if "number_of_returns" in names else None),
                     gps_time=(np.asarray(raw_chunk.gps_time, dtype=np.float64) if "gps_time" in names else None),
@@ -220,6 +257,12 @@ def gps_run_labels(gps_time: Optional[np.ndarray]) -> Optional[np.ndarray]:
     finite = values[np.isfinite(values)]
     if len(finite) < 1000:
         return None
+    # The k-means is 40 passes over the array; on a 500k-point chunk that is
+    # pure overhead for a two-cluster split. Fixed-stride sample keeps it
+    # deterministic and O(50k) regardless of file size.
+    if len(finite) > 50_000:
+        stride = max(2, len(finite) // 50_000)
+        finite = finite[::stride]
     low, high = float(finite.min()), float(finite.max())
     if high - low < 1e-3:
         return None

@@ -35,7 +35,13 @@ import laspy
 import numpy as np
 
 from .assets import TileContext, detect_all
-from .instances import merge_linear_pieces
+from .instances import (
+    dedupe_pole_detections,
+    merge_linear_pieces,
+    merge_linear_safety_pieces,
+    merge_marking_segments,
+    merge_surface_fragments,
+)
 from .assessment import assess_all
 from .confidence import ConfidenceFactors, score_asset, support_score
 from .export import write_outputs
@@ -110,17 +116,17 @@ STAGES = ("validating", "streaming", "pointcept", "openpcseg", "roadmarking", "d
 
 
 def _elevation_color(z01: np.ndarray) -> List[List[float]]:
-    colors = []
-    for value in z01.tolist():
-        t = max(0.0, min(1.0, value))
-        if t < 0.5:
-            local = t / 0.5
-            a, b = _STOPS[0], _STOPS[1]
-        else:
-            local = (t - 0.5) / 0.5
-            a, b = _STOPS[1], _STOPS[2]
-        colors.append([round(a[i] + (b[i] - a[i]) * local, 4) for i in range(3)])
-    return colors
+    """Elevation-gradient RGB colors, vectorized (per-point Python loop measured
+    at ~20% of pipeline runtime on a 210 k-point corridor)."""
+    z = np.clip(np.asarray(z01, dtype=np.float64), 0.0, 1.0)
+    below = z < 0.5
+    local = np.where(below, z / 0.5, (z - 0.5) / 0.5)
+    stops = np.asarray(_STOPS, dtype=np.float64)
+    segment = np.where(below, 0, 1)
+    a = stops[segment]
+    b = stops[segment + 1]
+    colors = np.round(a + (b - a) * local[:, None], 4)
+    return colors.tolist()
 
 
 def _tile_header(source_header: laspy.LasHeader) -> laspy.LasHeader:
@@ -154,15 +160,41 @@ def _tile_header(source_header: laspy.LasHeader) -> laspy.LasHeader:
     return header
 
 
+#: Writable-tile-header cache: one entry per distinct source header (per run
+#: there is exactly one source, so this is one entry). Building a LasHeader +
+#: copying its VLR list costs real time; doing it for every (chunk x tile)
+#: append was measurable overhead on large files. Keyed by the header's own
+#: identity fingerprint, never by file path (tiles are internal artifacts).
+_TILE_HEADER_CACHE: Dict[tuple, laspy.LasHeader] = {}
+
+
+def _tile_header_cached(source_header: laspy.LasHeader) -> laspy.LasHeader:
+    """Return the writable tile header for a source header, cached per header."""
+    key = (
+        str(source_header.version),
+        int(source_header.point_format.id),
+        tuple(float(v) for v in source_header.scales),
+        tuple(float(v) for v in source_header.offsets),
+    )
+    cached = _TILE_HEADER_CACHE.get(key)
+    if cached is not None:
+        return cached
+    built = _tile_header(source_header)
+    _TILE_HEADER_CACHE[key] = built
+    return built
+
+
 def _append_tile(tiles_dir: Path, tile_name: str, source_header: laspy.LasHeader, chunk: object, mask: np.ndarray) -> None:
     """Append a chunk's subset of points to a tile's LAS file (create on first touch)."""
     tile_path = tiles_dir / f"{tile_name}.las"
-    data = laspy.LasData(_tile_header(source_header))
+    data = laspy.LasData(_tile_header_cached(source_header))
     data.x, data.y, data.z = chunk.x[mask], chunk.y[mask], chunk.z[mask]
     if "intensity" in data.point_format.dimension_names:
         data.intensity = chunk.intensity[mask]
     if chunk.rgb is not None and {"red", "green", "blue"}.issubset(data.point_format.dimension_names):
         data.red, data.green, data.blue = chunk.rgb[mask, 0], chunk.rgb[mask, 1], chunk.rgb[mask, 2]
+    if chunk.nir is not None and "nir" in data.point_format.dimension_names:
+        data.nir = chunk.nir[mask]
     if chunk.gps_time is not None and "gps_time" in data.point_format.dimension_names:
         data.gps_time = chunk.gps_time[mask]
     if chunk.point_source_id is not None and "point_source_id" in data.point_format.dimension_names:
@@ -185,7 +217,9 @@ def _stream_tiles(
 ) -> Tuple[RunSummary, List[str], dict]:
     """Pass 1: validate, stream chunks, write tiles, sample viewer data."""
     warnings: List[str] = []
-    validation = validate_las(input_path, strict_las14=settings.strict_las14)
+    validation = validate_las(
+        input_path, strict_las14=settings.strict_las14, crs_fallback=settings.crs_fallback,
+    )
     warnings.extend(validation.as_warning_messages())
     metadata = validation.metadata
     crs = metadata.crs
@@ -236,6 +270,27 @@ def _stream_tiles(
         for chunk_number, (_, _, chunk) in enumerate(iter_chunks(input_path, settings.chunk_size, stride=input_stride)):
             x, y, z = chunk.x, chunk.y, chunk.z
             processed += len(x)
+            if chunk_number == 0:
+                # Dead radiometric channels: some exporters keep the RGB/intensity
+                # dimensions but never fill them ("no-color" LAS 1.4 fmt 7
+                # exports). An all-zero channel must not silently feed the
+                # marking detector as "everything is bright" - report it so the
+                # run.json warnings explain exactly what happened (and the
+                # detector itself also guards per-tile in bright_near_ground_mask).
+                if metadata.has_intensity and len(chunk.intensity):
+                    finite_intensity = chunk.intensity[np.isfinite(chunk.intensity)]
+                    if not len(finite_intensity) or float(finite_intensity.max()) <= 0.0:
+                        warnings.append(
+                            "[INTENSITY_DEAD] The intensity channel is all zeros; "
+                            "marking detection falls back to RGB/NIR brightness or geometry only."
+                        )
+                if chunk.rgb is not None and len(chunk.rgb):
+                    finite_rgb = chunk.rgb[np.isfinite(chunk.rgb)]
+                    if not len(finite_rgb) or float(finite_rgb.max()) <= 0.0:
+                        warnings.append(
+                            "[RGB_DEAD] The RGB channel is all zeros (a no-color export); "
+                            "color-based marking evidence is unavailable."
+                        )
             if progress:
                 _progress(f"Streaming chunk {chunk_number + 1}", processed, metadata.point_count)
             if progress_callback:
@@ -474,6 +529,7 @@ def _extract_tile_assets(
     tiles_dir: Path, tile_name: str, summary: RunSummary, settings: ProcessingSettings,
     predictions: Dict[str, np.ndarray], class_names: List[str],
     class_mapping: Dict[str, Dict[str, object]], sample_stride: int,
+    classifier: object = None,
 ) -> Tuple[List[Asset], int]:
     """Pass 3 (worker): one tile -> assets (ground, features, detectors, attribution).
 
@@ -495,6 +551,7 @@ def _extract_tile_assets(
     rgb = None
     if {"red", "green", "blue"}.issubset(names):
         rgb = np.column_stack((np.asarray(chunk.red), np.asarray(chunk.green), np.asarray(chunk.blue))).astype(np.float64)
+    nir = np.asarray(chunk.nir, dtype=np.float64) if "nir" in names else None
     gps_time = np.asarray(chunk.gps_time, dtype=np.float64) if "gps_time" in names else None
     point_source_id = np.asarray(chunk.point_source_id, dtype=np.int64) if "point_source_id" in names else None
 
@@ -506,15 +563,19 @@ def _extract_tile_assets(
 
     ctx = TileContext(
         tile=tile_name, x=x, y=y, z=z, height=height, ground=ground, intensity=intensity, rgb=rgb,
+        nir=nir,
         # Provenance: tile-local indices + tile name; the run manifest records the
         # streaming order so source points remain traceable.
         source_indices=np.arange(len(x), dtype=np.int64),
         gps_labels=gps_run_labels(gps_time), point_source_id=point_source_id, crs=summary.crs,
         model_class=model_class, class_names=class_names, mapping=class_mapping,
         settings=settings, id_counts=Counter(), sample_stride=sample_stride,
-        viewer_limit=settings.viewer_point_limit,
+        viewer_limit=settings.viewer_point_limit, classifier=classifier,
     )
     assets = detect_all(ctx)
+    if getattr(settings, "collect_training", False):
+        from .learned import flush_training_buffer
+        flush_training_buffer(ctx)
     for asset in assets:
         _attach_highlight_points(ctx, asset)
     return assets, int(len(x))
@@ -563,12 +624,15 @@ def _compute_point_classes(viewer_points: List[List[float]], assets: List[Asset]
     if not viewer_points or not assets:
         return [0] * count
     cell = 1.0
+    max_label_points_per_asset = 64  # 1 m match radius covers 0.5 m stride
     rows: List[Tuple[float, float, float, float]] = []
     for class_id, name in enumerate(class_names, start=1):
         for asset in assets:
             if asset.asset_class != name:
                 continue
-            for point in (asset.geometry or {}).get("highlight_points", []):
+            points = (asset.geometry or {}).get("highlight_points", [])
+            stride = max(1, math.ceil(len(points) / max_label_points_per_asset))
+            for point in points[::stride]:
                 rows.append((class_id, point[0], point[1], point[2]))
     if not rows:
         return [0] * count
@@ -591,30 +655,57 @@ def _compute_point_classes(viewer_points: List[List[float]], assets: List[Asset]
     best = np.full(count, radius2 * radius2, dtype=np.float64)
     best_class = np.zeros(count, dtype=np.int64)
     index_range = np.arange(count, dtype=np.int64)
+    # Pre-filter (lossless): a viewer point can only match a highlight point if
+    # its cell lies within Chebyshev distance 1 of an occupied highlight cell.
+    # Build the occupied *neighborhood* set from the highlight side (M cells,
+    # small), then one membership test for all N points. On real corridors most
+    # viewer points are far from any asset, so the 27-offset search below then
+    # runs over a small candidate subset instead of the whole cloud.
+    structured = np.dtype([("a", "i8"), ("b", "i8"), ("c", "i8")])
+    neighbor_parts = [
+        np.column_stack((hx + dx, hy + dy, hz + dz)).view(structured).ravel()
+        for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)
+    ]
+    # One sort of the concatenated neighborhood keys (no per-offset unique):
+    # membership is decided by a binary search + equality against the sorted
+    # array, duplicates are harmless for an existence test.
+    neighbor_cells = np.sort(np.concatenate(neighbor_parts))
+    point_keys = np.column_stack((vcx, vcy, vcz)).view(structured).ravel()
+    pos = np.searchsorted(neighbor_cells, point_keys, side="left")
+    pos_clipped = np.minimum(pos, len(neighbor_cells) - 1)
+    occupied = neighbor_cells[pos_clipped] == point_keys
+    candidates = np.flatnonzero(occupied)
+    if not len(candidates):
+        return [0] * count
+    # Search only the candidate subset; remap results back to point indices.
+    sub_vcx, sub_vcy, sub_vcz = vcx[candidates], vcy[candidates], vcz[candidates]
+    sub_vx, sub_vy, sub_vz = vx[candidates], vy[candidates], vz[candidates]
+    sub_best = best[candidates]
+    sub_best_class = best_class[candidates]
+    sub_range = np.arange(len(candidates), dtype=np.int64)
     for dx in (-1, 0, 1):
         for dy in (-1, 0, 1):
             for dz in (-1, 0, 1):
-                target = np.column_stack((vcx + dx, vcy + dy, vcz + dz)).view(
-                    np.dtype([("a", "i8"), ("b", "i8"), ("c", "i8")])
-                ).ravel()
+                target = np.column_stack((sub_vcx + dx, sub_vcy + dy, sub_vcz + dz)).view(structured).ravel()
                 start = np.searchsorted(cell_keys, target, side="left")
                 end = np.searchsorted(cell_keys, target, side="right")
                 lengths = end - start
                 total = int(lengths.sum())
                 if total == 0:
                     continue
-                owner = np.repeat(index_range, lengths)
+                owner = np.repeat(sub_range, lengths)
                 segment_begin = np.repeat(np.cumsum(lengths) - lengths, lengths)
                 hl = start[owner] + (np.arange(total, dtype=np.int64) - segment_begin)
                 d2 = (
-                    (vx[owner] - highlight[hl, 1]) ** 2
-                    + (vy[owner] - highlight[hl, 2]) ** 2
-                    + (vz[owner] - highlight[hl, 3]) ** 2
+                    (sub_vx[owner] - highlight[hl, 1]) ** 2
+                    + (sub_vy[owner] - highlight[hl, 2]) ** 2
+                    + (sub_vz[owner] - highlight[hl, 3]) ** 2
                 )
-                improved = d2 < best[owner]
+                improved = d2 < sub_best[owner]
                 updated = owner[improved]
-                best[updated] = d2[improved]
-                best_class[updated] = highlight[hl[improved], 0].astype(np.int64)
+                sub_best[updated] = d2[improved]
+                sub_best_class[updated] = highlight[hl[improved], 0].astype(np.int64)
+    best_class[candidates] = sub_best_class
     return best_class.tolist()
 
 
@@ -728,7 +819,9 @@ def process_las(
             existing = [t for t in manifest.get("tiles", [])
                         if (tiles_dir / f"{t}.las").is_file()]
             if existing and manifest.get("input_sha256") == _file_sha256(path):
-                validation = validate_las(path, strict_las14=settings.strict_las14)
+                validation = validate_las(
+                    path, strict_las14=settings.strict_las14, crs_fallback=settings.crs_fallback,
+                )
                 metadata = validation.metadata
                 resumed_summary = RunSummary(
                     input_path=str(path), point_count=metadata.point_count,
@@ -842,6 +935,33 @@ def process_las(
     id_counts: Counter = Counter()
     sample_stride = max(1, math.ceil(summary.point_count / settings.viewer_point_limit))
     all_assets: List[Asset] = []
+    # ---- Learned component classifier (CPU prior) ----------------------------
+    # Trained on labeled ground truth (scripts/train_classifier.py, Quick
+    # Simulation scenes; the same feature conventions as the Toronto-3D/PTv3
+    # MLS literature). Fills the `model` confidence factor when no GPU prior
+    # (Pointcept/OpenPCSeg) is present, and vetoes candidates the trained
+    # model confidently rejects. Absent file -> None -> geometry-only path.
+    classifier = None
+    if settings.learned_prior_enabled and not predictions:
+        from .learned import load_classifier
+        classifier = load_classifier(
+            Path(settings.learned_classifier_path) if settings.learned_classifier_path else None
+        )
+        if classifier is not None:
+            summary.warnings.append(
+                f"Learned component classifier '{classifier.version}' active: trained class "
+                "evidence feeds the model confidence factor (CPU prior; geometry still gates "
+                "every asset)."
+            )
+            # Same dict object as summary.backend — provenance lands in run.json.
+            backend["learned_classifier"] = {
+                "version": classifier.version,
+                "training": classifier.training,
+            }
+        if getattr(settings, "collect_training", False):
+            settings.output_dir = str(output)
+    elif getattr(settings, "collect_training", False):
+        settings.output_dir = str(output)
     # Per-tile extraction cache: a run killed mid-detection resumes from the
     # tiles it already finished instead of redoing them (each tile's assets are
     # deterministic, so a cached tile is identical to a fresh extraction).
@@ -864,7 +984,7 @@ def process_las(
                 results[index] = cached
                 continue
             futures[pool.submit(_extract_tile_assets, output / "tiles", tile_name, summary, settings,
-                               predictions, class_names, class_mapping, sample_stride)] = index
+                               predictions, class_names, class_mapping, sample_stride, classifier)] = index
         try:
             for future in as_completed(futures):
                 index = futures[future]
@@ -894,6 +1014,18 @@ def process_las(
     # the collinear pieces back into spans before QC/assessment so each span is
     # one asset (merges across shared poles are explicitly refused).
     all_assets = merge_linear_pieces(all_assets)
+    # Linear safety assets (guardrails, concrete barriers) are also fragmented by
+    # tile boundaries; re-join collinear pieces into one continuous roadside asset.
+    all_assets = merge_linear_safety_pieces(all_assets)
+    # Ground/marking detectors emit one blob per tile, so flat surfaces must be
+    # re-joined by footprint overlap or a corridor reports dozens of pavement
+    # "assets". Poles seen from both sides of a tile edge are deduplicated the
+    # same way, before QC counts the inventory.
+    all_assets = merge_surface_fragments(all_assets)
+    # Painted markings fragment *within* tiles too (dashed centreline blobs ~9 m
+    # apart on the same heading); join collinear fragments into one marking line.
+    all_assets = merge_marking_segments(all_assets)
+    all_assets = dedupe_pole_detections(all_assets)
 
     # ---- Optional learned backend: Gemini class-validation booster ----------------------
     # Geometry decided every asset; Gemini independently validates the assigned
@@ -935,6 +1067,30 @@ def process_las(
     all_assets, qc_report = run_quality_control(all_assets, settings)
     assess_all(all_assets, settings.review_confidence_threshold)
     summary.assets = all_assets
+    # Honesty gate: painted markings / rumble strips are detected from brightness
+    # (RGB when present, intensity otherwise). A no-color export with flat
+    # intensity (measured on the Trimble MX9 "no-color" variants: p99/median
+    # ratio ~1.2, paint indistinguishable from asphalt) silently collapses the
+    # marking count by an order of magnitude. Say it out loud instead of
+    # reporting a misleadingly thin inventory.
+    try:
+        meta = validate_las(path, strict_las14=settings.strict_las14).metadata
+    except Exception:
+        meta = None
+    if meta is not None and hasattr(meta, "has_rgb") and not meta.has_rgb:
+        marking_count = sum(1 for a in all_assets if a.asset_class == "pavement_marking")
+        rumble_count = sum(1 for a in all_assets if a.asset_class == "rumble_strip")
+        signal = (
+            "the intensity channel is flat (paint is not separable from asphalt)"
+            if getattr(meta, "has_intensity", False)
+            else "there is no intensity channel either"
+        )
+        summary.warnings.append(
+            f"Input has NO color (RGB) channel: pavement markings and rumble strips are "
+            f"detected from brightness, and here {signal}, so only high-retroreflectivity "
+            f"paint was found ({marking_count} markings, {rumble_count} rumble strips). "
+            f"Upload the color (RGB) export of the same scan for full paint detection."
+        )
     summary.elapsed_seconds = time.monotonic() - started
 
     # ---- Optional MongoDB mirror -------------------------------------------------------
