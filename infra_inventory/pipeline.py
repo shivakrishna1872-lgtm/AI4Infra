@@ -1049,30 +1049,51 @@ def process_las(
         print(f"[detection] processing {len(tile_names)} tiles on {workers} worker processes", flush=True)
     results: Dict[int, Tuple[List[Asset], int]] = {}
     completed = 0
-    with ProcessPoolExecutor(
-        max_workers=workers, mp_context=multiprocessing.get_context("fork")
-    ) as pool:
-        futures = {}
+    if workers == 1 or len(tile_names) == 1:
         for index, tile_name in enumerate(tile_names):
             cached = _read_tile_cache(cache_dir, tile_name)
             if cached is not None:
                 results[index] = cached
                 continue
-            futures[pool.submit(_extract_tile_assets, output / "tiles", tile_name, summary, settings,
-                               predictions, class_names, class_mapping, sample_stride, classifier)] = index
-        try:
-            for future in as_completed(futures):
-                index = futures[future]
-                tile_assets, point_count = future.result()
-                results[index] = (tile_assets, point_count)
-                _write_tile_cache(cache_dir, tile_names[index], tile_assets, point_count)
-                completed += 1
-                report("detecting", tiles_done=completed, tiles_total=len(tile_names),
-                       message=f"Detecting assets in {tile_names[index]}")
-        except Exception:
-            for future in futures:
-                future.cancel()
-            raise
+            tile_assets, point_count = _extract_tile_assets(
+                output / "tiles", tile_name, summary, settings,
+                predictions, class_names, class_mapping, sample_stride, classifier,
+            )
+            results[index] = (tile_assets, point_count)
+            _write_tile_cache(cache_dir, tile_name, tile_assets, point_count)
+            completed += 1
+            report("detecting", tiles_done=completed, tiles_total=len(tile_names),
+                   message=f"Detecting assets in {tile_name}")
+    else:
+        mp_ctx = (
+            multiprocessing.get_context("fork")
+            if "fork" in multiprocessing.get_all_start_methods()
+            else multiprocessing.get_context()
+        )
+        with ProcessPoolExecutor(
+            max_workers=workers, mp_context=mp_ctx
+        ) as pool:
+            futures = {}
+            for index, tile_name in enumerate(tile_names):
+                cached = _read_tile_cache(cache_dir, tile_name)
+                if cached is not None:
+                    results[index] = cached
+                    continue
+                futures[pool.submit(_extract_tile_assets, output / "tiles", tile_name, summary, settings,
+                                   predictions, class_names, class_mapping, sample_stride, classifier)] = index
+            try:
+                for future in as_completed(futures):
+                    index = futures[future]
+                    tile_assets, point_count = future.result()
+                    results[index] = (tile_assets, point_count)
+                    _write_tile_cache(cache_dir, tile_names[index], tile_assets, point_count)
+                    completed += 1
+                    report("detecting", tiles_done=completed, tiles_total=len(tile_names),
+                           message=f"Detecting assets in {tile_names[index]}")
+            except Exception:
+                for future in futures:
+                    future.cancel()
+                raise
     for tile_index, tile_name in enumerate(tile_names):
         tile_assets, point_count = results[tile_index]
         if progress:
