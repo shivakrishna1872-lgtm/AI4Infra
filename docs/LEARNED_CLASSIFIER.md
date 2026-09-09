@@ -53,12 +53,12 @@ score becomes the `model` factor on every asset. Asset records now show
 
 ## Measured accuracy
 
-Trained with `python scripts/train_classifier.py` (10 train seeds, 6 held-out
+Trained with `python scripts/train_classifier.py` (20 train seeds, 11 held-out
 validation seeds the model never sees, 400 m scenes, 800 epochs):
 
 ```
-train:    n=2406  accuracy=1.000  macro-F1 (excl. background)=1.000
-held-out: n=1444  accuracy=1.000  macro-F1 (excl. background)=1.000
+train:    n=4754  accuracy=1.000  macro-F1 (excl. background)=1.000
+held-out: n=2610  accuracy=1.000  macro-F1 (excl. background)=1.000
 ```
 
 Per class on held-out scenes (all nine asset classes + background):
@@ -71,7 +71,7 @@ Pipeline quality (per train seed, after the cross-tile merge passes):
 
 | metric | value | meaning |
 | --- | --- | --- |
-| compact per-object F1 | **1.000** on every seed | poles, conductors, cabinets, signs, rumble strips — one detection per object, no misses, no extras |
+| compact per-object F1 | **1.000** on all 20 seeds | poles, conductors, cabinets, signs, rumble strips — one detection per object, no misses, no extras |
 | area/linear recall | **1.000** on every seed | pavement, markings, guardrails, barriers — every ground-truth span/deck covered |
 | fragmentation | **2.4-2.8** detections per GT object | corridor assets after merging (down from ~20 pavement fragments and ~58 marking fragments before the merge work) |
 

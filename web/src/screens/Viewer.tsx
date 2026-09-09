@@ -6,6 +6,7 @@ import { api } from "../api";
 import Scene3D, { type Fly } from "../scene/Scene3D";
 import InspectPanel from "../components/InspectPanel";
 import LayersPanel from "../components/LayersPanel";
+import ConfidenceCard from "../components/ConfidenceCard";
 
 interface Props {
   project: Project;
@@ -13,11 +14,11 @@ interface Props {
 }
 
 const EXPORTS = [
-  { name: "assets.json", label: "JSON" },
-  { name: "assets.csv", label: "CSV" },
-  { name: "assets.geojson", label: "GEOJSON" },
-  { name: "inventory.json", label: "INVENTORY" },
-  { name: "run.json", label: "REPORT" },
+  { kind: "json", label: "JSON" },
+  { kind: "csv", label: "CSV" },
+  { kind: "geojson", label: "GEOJSON" },
+  { kind: "inventory", label: "INVENTORY" },
+  { kind: "report", label: "REPORT (.md)" },
 ];
 
 export default function Viewer({ project, onBack }: Props) {
@@ -37,6 +38,8 @@ export default function Viewer({ project, onBack }: Props) {
   const [measurePoints, setMeasurePoints] = useState<[number, number, number][]>([]);
   const [pointSize, setPointSize] = useState(1);
   const [search, setSearch] = useState("");
+  const [downloading, setDownloading] = useState<string | null>(null);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
   const [flySig, setFlySig] = useState(0);
   const [presetKind, setPresetKind] = useState<"reset" | "top" | "side">("reset");
   const [presetSig, setPresetSig] = useState(0);
@@ -266,10 +269,25 @@ export default function Viewer({ project, onBack }: Props) {
           />
         </div>
 
+        {downloadError && <span className="dl-error">{downloadError}</span>}
         {EXPORTS.map((exp) => (
-          <a key={exp.name} className="tbtn export-link" href={api.exportUrl(project.id, exp.name)} download>
-            {exp.label}
-          </a>
+          <button
+            key={exp.kind}
+            className="tbtn"
+            disabled={downloading !== null}
+            onClick={() => {
+              setDownloadError(null);
+              setDownloading(exp.kind);
+              api
+                .downloadExport(project.id, exp.kind, `ai4infra-${exp.kind}.json`)
+                .catch((err) =>
+                  setDownloadError(err instanceof Error ? err.message : String(err))
+                )
+                .finally(() => setDownloading(null));
+            }}
+          >
+            {downloading === exp.kind ? "SAVING…" : `↓ ${exp.label}`}
+          </button>
         ))}
 
         <button className="tbtn" onClick={onBack}>Projects</button>
@@ -369,6 +387,9 @@ export default function Viewer({ project, onBack }: Props) {
           />
         ) : (
           <aside className="sidebar">
+            {data.run.confidence_report && (
+              <ConfidenceCard confidence={data.run.confidence_report} />
+            )}
             <div className="sb-head">
               <h3>Assets · {visibleAssets.length}</h3>
             </div>
@@ -400,6 +421,15 @@ export default function Viewer({ project, onBack }: Props) {
         <span className="stat">POINTS <b>{data.run.point_count.toLocaleString()}</b></span>
         <span className="stat">TILES <b>{data.run.tile_count}</b></span>
         <span className="stat">ASSETS <b>{data.assets.length}</b></span>
+        {data.run.confidence_report && (
+          <span className="stat">
+            CONFIDENCE{" "}
+            <b style={{ color: "var(--accent)" }}>
+              {data.run.confidence_report.overall_percent}%{" "}
+              {data.run.confidence_report.grade.split(" ")[0]}
+            </b>
+          </span>
+        )}
         {classCounts.map(([cls, count]) => (
           <span className="stat" key={cls}>
             <span className="cls-dot" style={{ background: CLASS_COLORS[cls] ?? "#8899aa" }} />

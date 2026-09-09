@@ -1,22 +1,34 @@
 """Transparent confidence engine.
 
-Every asset confidence is a weighted blend of *measurable* factors:
+Two layers:
 
-* ``model``            - agreement with the learned Pointcept/PTv3 prior (None on the CPU geometry backend)
-* ``geometry``         - how well the instance matches its class's geometric priors (detector-measured)
-* ``support``          - point support relative to the class minimum
-* ``spatial_context``  - consistency with surrounding context (road proximity, compactness)
-* ``class_consistency``- intensity/RGB statistics matching the class's physical expectations
+1. **Per-asset confidence** — every asset confidence is a weighted blend of
+   *measurable* factors:
 
-Missing factors are ``None`` and the remaining weights are renormalized, so a
-confidence of 0.93 always means the same thing: *the measurable signals for this
-asset were consistently strong*. The explanation string says exactly which
-signals contributed.
+   * ``model``            - agreement with the learned Pointcept/PTv3 prior (None on the CPU geometry backend)
+   * ``geometry``         - how well the instance matches its class's geometric priors (detector-measured)
+   * ``support``          - point support relative to the class minimum
+   * ``spatial_context``  - consistency with surrounding context (road proximity, compactness)
+   * ``class_consistency``- intensity/RGB statistics matching the class's physical expectations
+
+   Missing factors are ``None`` and the remaining weights are renormalized, so a
+   confidence of 0.93 always means the same thing: *the measurable signals for this
+   asset were consistently strong*. The explanation string says exactly which
+   signals contributed.
+
+2. **Overall dataset confidence** (``compute_confidence_report``) — one score for
+   the whole processed report, evaluating the dataset behind it: point density &
+   coverage (30%), CRS & coordinate precision (30%), intensity & classification
+   reliability (20%), and geometric clustering fit (20%). The report ships in
+   ``run.json`` / ``inventory.json`` / ``viewer-data.json`` under
+   ``run.confidence_report`` and in the summary report, with a grade:
+   **High (Production Ready)** ≥ 90%, **Medium (Review Recommended)** 75-89%,
+   **Low (Manual Verification Required)** < 75%.
 """
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -160,3 +172,209 @@ def model_factor_from_prior(
 
 def low_confidence(confidence: float, settings: ProcessingSettings) -> bool:
     return confidence < settings.low_confidence_threshold
+
+
+# ---------------------------------------------------------------------------
+# Overall dataset confidence (per-report score)
+# ---------------------------------------------------------------------------
+
+#: Weights per component (sums to 1.0).
+WEIGHTS = {
+    "density_coverage": 0.30,
+    "crs": 0.30,
+    "intensity_classification": 0.20,
+    "geometry_fit": 0.20,
+}
+
+#: Point count that scores maximum density (a production mobile-LiDAR corridor).
+DENSITY_REFERENCE_POINTS = 100_000_000
+
+#: Expected physical dimension bounds per asset class: (length, width, height)
+#: as (min, max) metre ranges. Any measured dimension outside its range is a
+#: geometric implausibility; the component score is the mean per-dimension fit.
+GEOMETRY_BOUNDS: Dict[str, Dict[str, Tuple[float, float]]] = {
+    "utility_pole": {"length_m": (0.02, 1.0), "width_m": (0.02, 1.0), "height_m": (2.5, 18.0)},
+    "utility_cabinet": {"length_m": (0.2, 3.0), "width_m": (0.2, 3.0), "height_m": (0.3, 3.5)},
+    "traffic_sign": {"length_m": (0.0, 3.5), "width_m": (0.1, 3.5), "height_m": (0.3, 6.0)},  # flat panels measure ~0 in the thin axis
+    "guardrail": {"length_m": (0.5, 500.0), "width_m": (0.1, 1.0), "height_m": (0.35, 1.2)},
+    "safety_barrier": {"length_m": (0.5, 500.0), "width_m": (0.1, 1.5), "height_m": (0.3, 1.5)},
+    "pavement": {"length_m": (1.0, 5000.0), "width_m": (2.0, 30.0), "height_m": (0.0, 1.0)},
+    "pavement_marking": {"length_m": (0.1, 1000.0), "width_m": (0.02, 1.5), "height_m": (0.0, 0.3)},
+    "overhead_conductor": {"length_m": (2.0, 1000.0), "width_m": (0.001, 0.3), "height_m": (0.0, 0.3)},
+    "rumble_strip": {"length_m": (0.2, 100.0), "width_m": (0.1, 2.0), "height_m": (0.0, 0.4)},
+}
+
+
+def grade_for(percent: float) -> str:
+    """Map an overall percentage to the report grade string."""
+    if percent >= 90.0:
+        return "High (Production Ready)"
+    if percent >= 75.0:
+        return "Medium (Review Recommended)"
+    return "Low (Manual Verification Required)"
+
+
+def _density_coverage_score(
+    point_count: int,
+    bounds: Sequence[float],
+    tile_count: int,
+    tile_size_m: float = 40.0,
+) -> Tuple[float, str]:
+    """Point density vs the 100 M reference, blended with spatial coverage."""
+    density = min(1.0, point_count / DENSITY_REFERENCE_POINTS)
+    extent_x = max(0.0, float(bounds[3]) - float(bounds[0])) if len(bounds) >= 4 else 0.0
+    extent_y = max(0.0, float(bounds[4]) - float(bounds[1])) if len(bounds) >= 5 else 0.0
+    expected_tiles = max(1, math.ceil(extent_x / max(tile_size_m, 1e-6))) * max(
+        1, math.ceil(extent_y / max(tile_size_m, 1e-6))
+    )
+    coverage = min(1.0, tile_count / expected_tiles)
+    pts_per_sqm = point_count / max(extent_x * extent_y, 1e-6) if extent_x * extent_y > 0 else 0.0
+    score = 0.7 * density + 0.3 * coverage
+    detail = (
+        f"{point_count:,} points vs {DENSITY_REFERENCE_POINTS:,} reference "
+        f"(density {density:.0%}); {tile_count}/{expected_tiles} expected tiles "
+        f"covered ({coverage:.0%}); ~{pts_per_sqm:,.0f} pts/m²"
+    )
+    return min(1.0, score), detail
+
+
+def _crs_score(crs: Optional[str], warnings: Sequence[str]) -> Tuple[float, str]:
+    """Full marks for a resolved EPSG code; less for fallback/unresolved."""
+    text = (crs or "").strip()
+    if not text:
+        if any("CRS_FALLBACK" in w for w in warnings):
+            return 0.6, "CRS assumed via EPSG fallback (estimated, not from the LAS header)"
+        if any("CRS_UNRESOLVED" in w for w in warnings):
+            return 0.2, "No CRS found in the LAS header; coordinates carry no spatial reference"
+        return 0.4, "No CRS recorded"
+    if text.upper().startswith("EPSG:"):
+        return 1.0, f"Fully resolved coordinate reference system ({text})"
+    return 0.8, f"Coordinate reference system present but not an EPSG code ({text})"
+
+
+def _intensity_score(
+    point_format: int,
+    warnings: Sequence[str],
+    has_intensity: Optional[bool] = None,
+) -> Tuple[float, str]:
+    """LAS 1.4 fmt 6/7/8 (scanner channel, modern classification) score highest;
+    dead radiometric channels reduce the score."""
+    score = 0.9 if point_format >= 6 else 0.6
+    notes: list[str] = []
+    if point_format >= 6:
+        notes.append(f"LAS 1.4 point format {point_format} (scanner channel + classification flags)")
+    else:
+        notes.append(f"point format {point_format} (legacy; no scanner channel)")
+    if has_intensity is True:
+        score += 0.1
+        notes.append("intensity channel populated")
+    elif has_intensity is False:
+        score -= 0.3
+        notes.append("no intensity channel")
+    if any("INTENSITY_DEAD" in w for w in warnings):
+        score *= 0.5
+        notes.append("intensity is all zeros (dead channel)")
+    if any("RGB_DEAD" in w for w in warnings):
+        score *= 0.8
+        notes.append("RGB is all zeros (no-color export)")
+    if any("has NO color" in w for w in warnings):
+        score *= 0.85
+        notes.append("no RGB channel — brightness-based marking evidence reduced")
+    return min(1.0, max(0.0, score)), "; ".join(notes)
+
+
+def _geometry_fit_score(assets: Sequence[Any]) -> Tuple[float, str]:
+    """Mean per-dimension fit of detected assets against expected physical bounds."""
+    if not assets:
+        return 0.0, "No assets detected — nothing to validate against physical bounds"
+    fits: list[float] = []
+    plausible = 0
+    per_dim_ok = 0
+    per_dim_total = 0
+    for asset in assets:
+        bounds = GEOMETRY_BOUNDS.get(asset.asset_class)
+        if bounds is None:
+            continue
+        dims = getattr(asset, "dimensions", None) or {}
+        asset_ok = True
+        for key, (lo, hi) in bounds.items():
+            value = float(dims.get(key) or 0.0)
+            per_dim_total += 1
+            ok = lo <= value <= hi
+            per_dim_ok += 1 if ok else 0
+            asset_ok = asset_ok and ok
+        if asset_ok:
+            plausible += 1
+        fits.append(1.0 if asset_ok else 0.0)
+    if not fits:
+        return 0.0, "No assets with known physical bounds"
+    detail = (
+        f"{plausible}/{len(fits)} assets within expected class dimensions; "
+        f"{per_dim_ok}/{per_dim_total} individual dimensions plausible"
+    )
+    return sum(fits) / len(fits), detail
+
+
+def compute_confidence_report(
+    point_count: int,
+    bounds: Sequence[float],
+    tile_count: int,
+    crs: Optional[str],
+    point_format: int,
+    warnings: Sequence[str],
+    assets: Sequence[Any],
+    has_intensity: Optional[bool] = None,
+    tile_size_m: float = 40.0,
+) -> Dict[str, Any]:
+    """Compute the overall confidence report for a processed run.
+
+    All inputs are already available on ``RunSummary``/``LasMetadata`` after a
+    run; the result is a plain dict that embeds directly into ``run.json``,
+    ``inventory.json``, ``viewer-data.json`` and the summary report.
+    """
+    density, density_detail = _density_coverage_score(point_count, bounds, tile_count, tile_size_m)
+    crs_score, crs_detail = _crs_score(crs, warnings)
+    intensity, intensity_detail = _intensity_score(point_format, warnings, has_intensity)
+    geometry, geometry_detail = _geometry_fit_score(assets)
+
+    components = {
+        "density_coverage": {
+            "score": round(density, 4),
+            "percent": round(100 * density),
+            "weight": WEIGHTS["density_coverage"],
+            "detail": density_detail,
+        },
+        "crs": {
+            "score": round(crs_score, 4),
+            "percent": round(100 * crs_score),
+            "weight": WEIGHTS["crs"],
+            "detail": crs_detail,
+        },
+        "intensity_classification": {
+            "score": round(intensity, 4),
+            "percent": round(100 * intensity),
+            "weight": WEIGHTS["intensity_classification"],
+            "detail": intensity_detail,
+        },
+        "geometry_fit": {
+            "score": round(geometry, 4),
+            "percent": round(100 * geometry),
+            "weight": WEIGHTS["geometry_fit"],
+            "detail": geometry_detail,
+        },
+    }
+    overall = sum(
+        components[name]["score"] * WEIGHTS[name] for name in WEIGHTS
+    )
+    percent = round(100 * overall)
+    return {
+        "overall_percent": percent,
+        "grade": grade_for(percent),
+        "weights": dict(WEIGHTS),
+        "components": components,
+        "notes": [
+            "Overall confidence rates the *dataset* behind this inventory "
+            "(density, spatial reference, radiometric reliability, geometric "
+            "plausibility) — individual asset confidence is reported per asset.",
+        ],
+    }

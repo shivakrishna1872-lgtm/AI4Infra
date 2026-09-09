@@ -97,6 +97,19 @@ class LasChunk:
     classification: Optional[np.ndarray]
     global_offset: int  # first global point index of this chunk
     nir: Optional[np.ndarray] = None  # infrared (LAS 1.4 point format 8 only)
+    # --- remaining standard LAS dimensions (lossless tiling) ---
+    scan_angle: Optional[np.ndarray] = None  # fmt>=6 'scan_angle'; fmt<6 'scan_angle_rank'
+    user_data: Optional[np.ndarray] = None
+    scanner_channel: Optional[np.ndarray] = None  # fmt>=6
+    # Flag bits. laspy exposes the same flag dims (synthetic/key_point/withheld,
+    # plus overlap for fmt>=6) on every format, so one set of names covers all.
+    synthetic: Optional[np.ndarray] = None
+    key_point: Optional[np.ndarray] = None
+    withheld: Optional[np.ndarray] = None
+    overlap: Optional[np.ndarray] = None
+    scan_direction_flag: Optional[np.ndarray] = None
+    edge_of_flight_line: Optional[np.ndarray] = None
+    extra: Optional[Dict[str, np.ndarray]] = None  # extra-bytes dims (raw stored values)
 
 
 def parse_crs(reader: laspy.LasReader) -> Optional[str]:
@@ -232,6 +245,24 @@ def iter_chunks(path: str | Path, chunk_size: int, stride: int = 1) -> Iterator[
                     point_source_id=(np.asarray(raw_chunk.point_source_id, dtype=np.int64) if "point_source_id" in names else None),
                     classification=(np.asarray(raw_chunk.classification, dtype=np.int64) if "classification" in names else None),
                     global_offset=global_offset,
+                    scan_angle=(
+                        np.asarray(raw_chunk.scan_angle, dtype=np.int64)
+                        if "scan_angle" in names
+                        else (np.asarray(raw_chunk.scan_angle_rank, dtype=np.int64) if "scan_angle_rank" in names else None)
+                    ),
+                    user_data=(np.asarray(raw_chunk.user_data, dtype=np.int64) if "user_data" in names else None),
+                    scanner_channel=(np.asarray(raw_chunk.scanner_channel, dtype=np.int64) if "scanner_channel" in names else None),
+                    synthetic=(np.asarray(raw_chunk.synthetic, dtype=bool) if "synthetic" in names else None),
+                    key_point=(np.asarray(raw_chunk.key_point, dtype=bool) if "key_point" in names else None),
+                    withheld=(np.asarray(raw_chunk.withheld, dtype=bool) if "withheld" in names else None),
+                    overlap=(np.asarray(raw_chunk.overlap, dtype=bool) if "overlap" in names else None),
+                    scan_direction_flag=(np.asarray(raw_chunk.scan_direction_flag, dtype=bool) if "scan_direction_flag" in names else None),
+                    edge_of_flight_line=(np.asarray(raw_chunk.edge_of_flight_line, dtype=bool) if "edge_of_flight_line" in names else None),
+                    extra=(
+                        {name: np.asarray(raw_chunk[name]) for name in raw_chunk.point_format.extra_dimension_names}
+                        if raw_chunk.point_format.extra_dimension_names
+                        else None
+                    ),
                 )
                 global_offset += chunk_length
                 yield metadata, reader, chunk

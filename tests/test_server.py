@@ -93,6 +93,58 @@ def test_simulate_process_viewer_export_roundtrip(client):
     assert client.delete(f"/api/projects/{project['id']}").status_code == 200
 
 
+def test_download_endpoints_stream_attachments_and_confidence(client):
+    """/api/projects/{id}/download/{kind} streams real files with the right
+    MIME type and an attachment Content-Disposition; the processed report also
+    carries the overall confidence block (Requirement 1 + 2 verification)."""
+    project = client.post("/api/simulate").json()
+    job_id = client.post(f"/api/projects/{project['id']}/process", json={}).json()["job_id"]
+    status = wait_done(client, job_id)
+    assert status["stage"] == "done"
+    pid = project["id"]
+
+    expected = {
+        "json": ("application/json", ".json"),
+        "geojson": ("application/geo+json", ".geojson"),
+        "csv": ("text/csv", ".csv"),
+        "inventory": ("application/json", ".json"),
+        "run": ("application/json", ".json"),
+        "report": ("text/markdown", ".md"),
+    }
+    for kind, (media, ext) in expected.items():
+        response = client.get(f"/api/projects/{pid}/download/{kind}")
+        assert response.status_code == 200, kind
+        assert response.headers["content-type"].startswith(media), kind
+        disposition = response.headers.get("content-disposition", "")
+        assert "attachment" in disposition, kind
+        assert f"filename=\"" in disposition and ext in disposition, kind
+        assert len(response.content) > 0, kind
+
+    # unknown kinds 404 before touching the filesystem
+    assert client.get(f"/api/projects/{pid}/download/nope").status_code == 404
+
+    # Requirement 1: confidence block in viewer payload, run.json, and project info
+    payload = client.get(f"/api/projects/{pid}/viewer-data").json()
+    confidence = payload["run"]["confidence_report"]
+    assert confidence["overall_percent"] >= 0
+    assert confidence["grade"]
+    assert set(confidence["components"]) == {
+        "density_coverage", "crs", "intensity_classification", "geometry_fit",
+    }
+    run = client.get(f"/api/projects/{pid}/download/run").json()
+    assert run["confidence_report"]["overall_percent"] == confidence["overall_percent"]
+    info = client.get(f"/api/projects/{pid}").json()
+    assert info["confidence_percent"] == confidence["overall_percent"]
+    assert info["confidence_grade"] == confidence["grade"]
+
+    # the summary report mentions the confidence section
+    report = client.get(f"/api/projects/{pid}/download/report").text
+    assert "Overall confidence" in report
+    assert str(confidence["overall_percent"]) in report
+
+    client.delete(f"/api/projects/{pid}")
+
+
 def test_upload_rejects_non_las(client):
     project = client.post("/api/projects", params={"name": "bad"}).json()
     response = client.post(

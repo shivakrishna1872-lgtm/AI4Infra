@@ -1,3 +1,23 @@
+export interface ConfidenceComponent {
+  score: number;
+  percent: number;
+  weight: number;
+  detail: string;
+}
+
+export interface ConfidenceReport {
+  overall_percent: number;
+  grade: string;
+  weights: Record<string, number>;
+  components: {
+    density_coverage: ConfidenceComponent;
+    crs: ConfidenceComponent;
+    intensity_classification: ConfidenceComponent;
+    geometry_fit: ConfidenceComponent;
+  };
+  notes?: string[];
+}
+
 export interface RunInfo {
   input_path: string;
   point_count: number;
@@ -12,6 +32,7 @@ export interface RunInfo {
   warnings: string[];
   backend: Record<string, unknown>;
   processing_version: string;
+  confidence_report?: ConfidenceReport | null;
 }
 
 export interface Asset {
@@ -79,6 +100,8 @@ export interface Project {
   point_format: number | null;
   asset_count: number | null;
   summary: Record<string, unknown> | null;
+  confidence_percent?: number | null;
+  confidence_grade?: string | null;
 }
 
 export interface JobStatus {

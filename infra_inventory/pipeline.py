@@ -43,7 +43,7 @@ from .instances import (
     merge_surface_fragments,
 )
 from .assessment import assess_all
-from .confidence import ConfidenceFactors, score_asset, support_score
+from .confidence import ConfidenceFactors, compute_confidence_report, score_asset, support_score
 from .export import write_outputs
 from .las_reader import gps_run_labels, iter_chunks
 from .models import Asset, ProcessingSettings, RunSummary
@@ -157,6 +157,18 @@ def _tile_header(source_header: laspy.LasHeader) -> laspy.LasHeader:
         header.vlrs = list(source_header.vlrs)
     except Exception:
         pass
+    # Carry extra-bytes dimensions (LAS 1.4 only — older versions cannot
+    # declare them) so tiling preserves *every* dimension, not just the core
+    # ones. Extra dims with a scale/offset are skipped: writing them without
+    # rescaling would corrupt the stored integers, so it is safer to omit
+    # than to write wrong values.
+    try:
+        if str(source_header.version) >= "1.4":
+            for dim in source_header.point_format.extra_dimensions:
+                if getattr(dim, "scale", 1.0) in (1.0, None) and getattr(dim, "offset", 0.0) in (0.0, None):
+                    header.add_extra_dim(laspy.ExtraBytesParams(name=dim.name, type=dim.type))
+    except Exception:
+        pass
     return header
 
 
@@ -175,6 +187,7 @@ def _tile_header_cached(source_header: laspy.LasHeader) -> laspy.LasHeader:
         int(source_header.point_format.id),
         tuple(float(v) for v in source_header.scales),
         tuple(float(v) for v in source_header.offsets),
+        tuple(source_header.point_format.extra_dimension_names),
     )
     cached = _TILE_HEADER_CACHE.get(key)
     if cached is not None:
@@ -184,8 +197,22 @@ def _tile_header_cached(source_header: laspy.LasHeader) -> laspy.LasHeader:
     return built
 
 
-def _append_tile(tiles_dir: Path, tile_name: str, source_header: laspy.LasHeader, chunk: object, mask: np.ndarray) -> None:
-    """Append a chunk's subset of points to a tile's LAS file (create on first touch)."""
+def _append_tile(
+    tiles_dir: Path,
+    tile_name: str,
+    source_header: laspy.LasHeader,
+    chunk: object,
+    mask: np.ndarray,
+    writers: Optional[Dict[str, laspy.LasWriter]] = None,
+) -> None:
+    """Append a chunk's subset of points to a tile's LAS file (create on first touch).
+
+    Every source dimension present in the tile format is copied, so tiling is
+    lossless: X/Y/Z, intensity, RGB, NIR, GPS time, returns, point source,
+    classification, scan angle, user data, scanner channel, flag bits, and
+    extra-bytes dims. ``writers`` optionally holds open per-tile writers for
+    the streaming pass so a chunk never re-opens the same tile file.
+    """
     tile_path = tiles_dir / f"{tile_name}.las"
     data = laspy.LasData(_tile_header_cached(source_header))
     data.x, data.y, data.z = chunk.x[mask], chunk.y[mask], chunk.z[mask]
@@ -203,7 +230,38 @@ def _append_tile(tiles_dir: Path, tile_name: str, source_header: laspy.LasHeader
         data.return_number = chunk.return_number[mask]
     if chunk.number_of_returns is not None and "number_of_returns" in data.point_format.dimension_names:
         data.number_of_returns = chunk.number_of_returns[mask]
-    if tile_path.is_file():
+    if chunk.classification is not None and "classification" in data.point_format.dimension_names:
+        data.classification = chunk.classification[mask]
+    if chunk.scan_angle is not None and "scan_angle" in data.point_format.dimension_names:
+        data.scan_angle = chunk.scan_angle[mask]
+    elif chunk.scan_angle is not None and "scan_angle_rank" in data.point_format.dimension_names:
+        data.scan_angle_rank = chunk.scan_angle[mask]
+    if chunk.user_data is not None and "user_data" in data.point_format.dimension_names:
+        data.user_data = chunk.user_data[mask]
+    if chunk.scanner_channel is not None and "scanner_channel" in data.point_format.dimension_names:
+        data.scanner_channel = chunk.scanner_channel[mask]
+    for flag in ("synthetic", "key_point", "withheld", "overlap", "scan_direction_flag", "edge_of_flight_line"):
+        value = getattr(chunk, flag, None)
+        if value is not None and flag in data.point_format.dimension_names:
+            setattr(data, flag, value[mask])
+    if chunk.extra:
+        for name, values in chunk.extra.items():
+            if name in data.point_format.dimension_names:
+                data[name] = values[mask]
+    if writers is not None:
+        entry = writers.get(tile_name)
+        if entry is None:
+            if tile_path.is_file():
+                entry = ("append", laspy.open(tile_path, mode="a"))
+            else:
+                entry = ("write", laspy.open(tile_path, mode="w", header=data.header))
+            writers[tile_name] = entry
+        mode, writer = entry
+        if mode == "append":
+            writer.append_points(data.points)
+        else:
+            writer.write_points(data.points)
+    elif tile_path.is_file():
         with laspy.open(tile_path, mode="a") as writer:
             writer.append_points(data.points)
     else:
@@ -258,69 +316,86 @@ def _stream_tiles(
             "measured from the thinned cloud; source point counts are approximate."
         )
     processed = 0
-    with laspy.open(input_path) as reader:
-        tile_header = _tile_header(reader.header)
-        if str(reader.header.version) != str(tile_header.version):
-            warnings.append(
-                f"Input LAS {reader.header.version} is not writable by laspy; tiles are "
-                f"written as LAS {tile_header.version} (scales/offsets/dimensions preserved). "
-                "This only affects internal tile files, never the input."
-            )
-        source_header = reader.header
-        for chunk_number, (_, _, chunk) in enumerate(iter_chunks(input_path, settings.chunk_size, stride=input_stride)):
-            x, y, z = chunk.x, chunk.y, chunk.z
-            processed += len(x)
-            if chunk_number == 0:
-                # Dead radiometric channels: some exporters keep the RGB/intensity
-                # dimensions but never fill them ("no-color" LAS 1.4 fmt 7
-                # exports). An all-zero channel must not silently feed the
-                # marking detector as "everything is bright" - report it so the
-                # run.json warnings explain exactly what happened (and the
-                # detector itself also guards per-tile in bright_near_ground_mask).
-                if metadata.has_intensity and len(chunk.intensity):
-                    finite_intensity = chunk.intensity[np.isfinite(chunk.intensity)]
-                    if not len(finite_intensity) or float(finite_intensity.max()) <= 0.0:
-                        warnings.append(
-                            "[INTENSITY_DEAD] The intensity channel is all zeros; "
-                            "marking detection falls back to RGB/NIR brightness or geometry only."
-                        )
-                if chunk.rgb is not None and len(chunk.rgb):
-                    finite_rgb = chunk.rgb[np.isfinite(chunk.rgb)]
-                    if not len(finite_rgb) or float(finite_rgb.max()) <= 0.0:
-                        warnings.append(
-                            "[RGB_DEAD] The RGB channel is all zeros (a no-color export); "
-                            "color-based marking evidence is unavailable."
-                        )
+    writers: Dict[str, laspy.LasWriter] = {}
+    try:
+        with laspy.open(input_path) as reader:
+            tile_header = _tile_header(reader.header)
+            if str(reader.header.version) != str(tile_header.version):
+                warnings.append(
+                    f"Input LAS {reader.header.version} is not writable by laspy; tiles are "
+                    f"written as LAS {tile_header.version} (scales/offsets/dimensions preserved). "
+                    "This only affects internal tile files, never the input."
+                )
+            source_header = reader.header
+            for chunk_number, (_, _, chunk) in enumerate(iter_chunks(input_path, settings.chunk_size, stride=input_stride)):
+                x, y, z = chunk.x, chunk.y, chunk.z
+                processed += len(x)
+                if chunk_number == 0:
+                    # Dead radiometric channels: some exporters keep the RGB/intensity
+                    # dimensions but never fill them ("no-color" LAS 1.4 fmt 7
+                    # exports). An all-zero channel must not silently feed the
+                    # marking detector as "everything is bright" - report it so the
+                    # run.json warnings explain exactly what happened (and the
+                    # detector itself also guards per-tile in bright_near_ground_mask).
+                    if metadata.has_intensity and len(chunk.intensity):
+                        finite_intensity = chunk.intensity[np.isfinite(chunk.intensity)]
+                        if not len(finite_intensity) or float(finite_intensity.max()) <= 0.0:
+                            warnings.append(
+                                "[INTENSITY_DEAD] The intensity channel is all zeros; "
+                                "marking detection falls back to RGB/NIR brightness or geometry only."
+                            )
+                    if chunk.rgb is not None and len(chunk.rgb):
+                        finite_rgb = chunk.rgb[np.isfinite(chunk.rgb)]
+                        if not len(finite_rgb) or float(finite_rgb.max()) <= 0.0:
+                            warnings.append(
+                                "[RGB_DEAD] The RGB channel is all zeros (a no-color export); "
+                                "color-based marking evidence is unavailable."
+                            )
+                if progress:
+                    _progress(f"Streaming chunk {chunk_number + 1}", processed, metadata.point_count)
+                if progress_callback:
+                    progress_callback({"stage": "streaming", "points_processed": processed, "point_count": metadata.point_count})
+                mask = np.arange(len(x)) % pool_stride == 0
+                if mask.any():
+                    pool_x.extend(x[mask].tolist())
+                    pool_y.extend(y[mask].tolist())
+                    pool_z.extend(z[mask].tolist())
+                    if metadata.has_rgb and chunk.rgb is not None:
+                        pool_rgb.extend(np.clip(chunk.rgb[mask] / 65535.0, 0.0, 1.0).round(4).tolist())
+                    if metadata.has_intensity:
+                        values = chunk.intensity[mask]
+                        if values.max() > 0:
+                            pool_intensity.extend(np.clip(values / float(values.max()), 0.0, 1.0).round(4).tolist())
+                if chunk.point_source_id is not None:
+                    scanner_ids.extend(int(value) for value in np.unique(chunk.point_source_id) if int(value) > 0)
+                labels = gps_run_labels(chunk.gps_time)
+                if labels is not None and np.any(labels == 2):
+                    saw_run2 = True
+                tx = np.floor(x / settings.tile_size_m).astype(np.int64)
+                ty = np.floor(y / settings.tile_size_m).astype(np.int64)
+                # Pack (tile_x, tile_y) into one uint64 per point and run a single
+                # 1-D unique. This is provably injective (both offsets are
+                # subtracted first, so each lane fits in 32 bits) and avoids the
+                # 2-D column_stack + lexsort that np.unique(..., axis=0) needs —
+                # the hottest single spot in the streaming pass on large files.
+                tx_min = int(tx.min())
+                ty_min = int(ty.min())
+                keys = ((tx - tx_min).astype(np.uint64) << 32) | (ty - ty_min).astype(np.uint64)
+                for key in np.unique(keys):
+                    kx = int(key >> 32) + tx_min
+                    ky = int(key & 0xFFFFFFFF) + ty_min
+                    tile_mask = (tx == kx) & (ty == ky)
+                    tile_name = f"tile_{kx}_{ky}"
+                    if tile_name not in tile_names:
+                        tile_names.append(tile_name)
+                    _append_tile(tiles_dir, tile_name, source_header, chunk, tile_mask, writers)
             if progress:
-                _progress(f"Streaming chunk {chunk_number + 1}", processed, metadata.point_count)
-            if progress_callback:
-                progress_callback({"stage": "streaming", "points_processed": processed, "point_count": metadata.point_count})
-            mask = np.arange(len(x)) % pool_stride == 0
-            if mask.any():
-                pool_x.extend(x[mask].tolist())
-                pool_y.extend(y[mask].tolist())
-                pool_z.extend(z[mask].tolist())
-                if metadata.has_rgb and chunk.rgb is not None:
-                    pool_rgb.extend(np.clip(chunk.rgb[mask] / 65535.0, 0.0, 1.0).round(4).tolist())
-                if metadata.has_intensity:
-                    values = chunk.intensity[mask]
-                    if values.max() > 0:
-                        pool_intensity.extend(np.clip(values / float(values.max()), 0.0, 1.0).round(4).tolist())
-            if chunk.point_source_id is not None:
-                scanner_ids.extend(int(value) for value in np.unique(chunk.point_source_id) if int(value) > 0)
-            labels = gps_run_labels(chunk.gps_time)
-            if labels is not None and np.any(labels == 2):
-                saw_run2 = True
-            tx = np.floor(x / settings.tile_size_m).astype(np.int64)
-            ty = np.floor(y / settings.tile_size_m).astype(np.int64)
-            for key in np.unique(np.column_stack((tx, ty)), axis=0):
-                tile_mask = (tx == key[0]) & (ty == key[1])
-                tile_name = f"tile_{key[0]}_{key[1]}"
-                if tile_name not in tile_names:
-                    tile_names.append(tile_name)
-                _append_tile(tiles_dir, tile_name, source_header, chunk, tile_mask)
-        if progress:
-            print()
+                print()
+    finally:
+        # Flush every pooled writer so each tile's header point count and
+        # every dimension are durable on disk before detection reads them.
+        for _, writer in writers.values():
+            writer.close()
     # Voxel LOD pass: one point per occupied cell, ~viewer_point_limit cells.
     if pool_x:
         px = np.asarray(pool_x, dtype=np.float64)
@@ -1091,6 +1166,24 @@ def process_las(
             f"paint was found ({marking_count} markings, {rumble_count} rumble strips). "
             f"Upload the color (RGB) export of the same scan for full paint detection."
         )
+    # Overall dataset confidence (density/coverage, CRS, radiometrics, geometry
+    # fit) — computed once per run, embedded in every export and the UI. Runs
+    # after the honesty gate so the score sees the same warnings the report
+    # carries; a scoring failure must never fail the run.
+    try:
+        summary.confidence_report = compute_confidence_report(
+            point_count=summary.point_count,
+            bounds=summary.bounds,
+            tile_count=summary.tile_count,
+            crs=summary.crs,
+            point_format=summary.point_format,
+            warnings=summary.warnings,
+            assets=all_assets,
+            has_intensity=(meta.has_intensity if meta is not None else None),
+            tile_size_m=settings.tile_size_m,
+        )
+    except Exception as exc:  # the score must never fail a run
+        summary.warnings.append(f"Confidence scoring skipped: {exc}")
     summary.elapsed_seconds = time.monotonic() - started
 
     # ---- Optional MongoDB mirror -------------------------------------------------------

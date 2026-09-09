@@ -62,7 +62,7 @@ Open `http://127.0.0.1:8765`. The viewer is local and uses no CDN or cloud servi
 Verification:
 
 ```bash
-pytest -q          # full test suite, including detectors on the synthetic scene
+pytest -q          # 209 tests: readers, detectors, merges, uploads, LAZ, simulation, classifier, end-to-end
 ```
 
 ## Simulation & demo modes
@@ -121,12 +121,15 @@ machine. See [`docs/upstream-integration.md`](docs/upstream-integration.md) and
 | Utilities | Poles (narrow footprint + vertical extent + columnarity), overhead conductors (elevated thin linear chains, heuristic), cabinets (compact dense boxes) |
 | Signs | Planar panels (eigenvalue geometry) grouped with their vertical support into one asset |
 | Safety | Guardrails (long/low/narrow, roadside), concrete barriers (wide cross-section), rumble strips (repeating transverse bright bands, heuristic) |
-| Instances | Grid connected components → individual assets with unique IDs |
+| Instances | Grid connected components → individual assets with unique IDs; cross-tile merge passes re-join fragmented corridor assets (guardrails, barriers, pavement decks, marking lines, overhead conductors) into single continuous features |
+| Resume | Crash-safe: per-tile LAS + manifest bound to the input by SHA-256; interrupted runs resume from existing tiles (streaming pass skipped), and a per-tile detection cache skips finished tiles |
+| Uploads | Resumable chunked upload (~8 MiB parts, crash-resume, per-part retry); optional direct-to-S3 presigned multipart for multi-GB files (see [`docs/UPLOADS.md`](docs/UPLOADS.md)) |
 | Attribution | Source tile, source point indices, run (GPS-time split), scanner (`point_source_id`), intensity/RGB stats, orientation, CRS |
 | Confidence | Weighted blend of model / geometry / support / spatial-context / class-consistency factors, with an explanation string |
 | Quality control | `LOW_CONFIDENCE`, `LIKELY_DUPLICATE`, `UNUSUAL_DIMENSIONS`, `INVALID_GEOMETRY`, `BELOW_MIN_POINTS` flags |
 | ALP assessment | Observation → Interpretation → Recommended Action per asset (`condition`, `recommended_action`, `review_required`) from measured signals + calibrated confidence (see [`docs/ALP.md`](docs/ALP.md)) |
-| Export | `inventory.json`, `assets.json/csv/geojson`, per-asset JSON, `run.json`, `reports/`, `tiles/` (web runs remove tile intermediates; flat exports stay slim) |
+| Export | `inventory.json`, `assets.json/csv/geojson`, per-asset JSON, `run.json`, `reports/`, `tiles/` (web runs remove tile intermediates; flat exports stay slim); browser downloads via `/api/projects/{id}/download/{json|geojson|csv|inventory|run|report}` (attachment MIME + filename) |
+| Overall confidence | One dataset-level score per report (0-100% + grade): point density & coverage 30%, CRS 30%, intensity & classification 20%, geometric fit 20% — shipped as `run.confidence_report` in every export and shown as a dashboard card with the four-way breakdown |
 | 3D viewer | Dependency-free WebGL viewer: elevation-colored cloud, class filters, asset list, click-to-inspect with source-point highlight |
 
 ## Optional learned backend: Pointcept / PTv3
@@ -207,9 +210,22 @@ Between the geometry backend and the GPU backends sits a trained component
 classifier (pure numpy; trained by `scripts/train_classifier.py` on labeled
 Quick-Simulation ground truth with extent-aware relabeling). It fills the
 `model` confidence factor on every asset and can veto candidates it
-confidently rejects. Measured held-out A/B: precision 0.219 → 0.221 with
-recall identical (one false positive vetoed, nothing correct removed).
-See [`docs/LEARNED_CLASSIFIER.md`](docs/LEARNED_CLASSIFIER.md).
+confidently rejects (area/linear classes are veto-exempt — their class is
+resolved by the span-level merge, never by deletion). Current shipped model
+(`configs/learned_classifier.json`, version `learned-v1`):
+
+* **20 train seeds / 4,754 labeled components**, 800 epochs — and **11 held-out
+  seeds / 2,610 components the model never saw** (fresh scenes in every round).
+* **100% accuracy on train and held-out**, all 9 classes + background at
+  P/R/F1 = 1.00.
+* End-to-end pipeline on all 20 train seeds: **compact per-object F1 = 1.000**
+  (poles/signs/cabinets/conductors/rumble), **area/linear recall = 1.000**
+  (pavement/markings/guardrails/barriers), **2.6 detections per GT object**
+  (tile fragments, merged into continuous features).
+
+Retrain after detector changes with `python scripts/train_classifier.py`.
+See [`docs/LEARNED_CLASSIFIER.md`](docs/LEARNED_CLASSIFIER.md) and
+[`docs/ACCURACY_REPORT.md`](docs/ACCURACY_REPORT.md).
 
 GPU notes: PTv3 requires CUDA and Pointcept's CUDA ops. FlashAttention is **optional**
 upstream — configure `enable_flash=False` and smaller patch sizes on non-compatible
@@ -255,39 +271,54 @@ LAS 1.4 / PDR 7 output; run separation survives through `gps_time`.
 infra_inventory/
 ├── cli.py                  # process / serve / validate / tile / backends / download-models / train / demo-data
 ├── pipeline.py             # orchestrator: streaming → tiles → detection → QC → export
-├── las_reader.py           # streaming LAS/LAZ reader, CRS, GPS-run separation
+├── las_reader.py           # streaming LAS/LAZ reader, CRS, NIR, GPS-run separation
 ├── validation.py           # LAS validation with fix hints
 ├── preprocessing.py        # tiling, ground, density, z-range features
-├── instances.py            # connected components + PCA component metrics
+├── instances.py            # connected components + PCA metrics + cross-tile merge passes
 ├── assets/                 # pavement.py, utilities.py, signs.py, safety.py detectors
+├── learned.py              # trained CPU component classifier (prior + veto)
 ├── confidence.py           # transparent confidence engine
-├── gemini.py               # Gemini class-validation booster (stdlib HTTP, cached, failure-safe)
-├── merge.py                # MX9 dual-head/dual-run merge-clean (streaming, cell dedupe)
-├── attribution.py          # provenance fields (run/scanner/stats/orientation)
+├── assessment.py           # ALP: condition / recommended action / review
 ├── qc.py                   # duplicate/dimension/confidence flags
-├── export.py               # JSON/CSV/GeoJSON/per-asset/report writers
-├── viewer.py               # dependency-free WebGL viewer
+├── gemini.py               # Gemini class-validation booster (stdlib HTTP, cached, failure-safe)
+├── attribution.py          # provenance fields (run/scanner/stats/orientation)
+├── export.py / export_geojson.py / viewer.py / mongo_export.py   # JSON/CSV/GeoJSON/viewer/Mongo writers
 ├── pointcept.py            # real tools/test.py bridge + prediction loader
+├── openpcseg.py            # OpenPCSeg inference bridge + prediction loader
+├── tensor_export.py        # SemanticKITTI-convention tensor tiles for OpenPCSeg
 ├── roadmarking.py          # external C++ subsystem adapter + DXF parser
+├── merge.py                # MX9 dual-head/dual-run merge-clean (streaming, cell dedupe)
+├── upload_store.py         # resumable chunked uploads (local disk + S3 presign)
 ├── simulation.py           # Quick Simulation / Data Simulation pipelines
-├── server.py               # FastAPI app: project API + hosted web UI
 ├── synthetic.py            # synthetic mobile-LiDAR scene generators
+├── evaluate.py             # precision/recall/F1 + positional error scoring
+├── server.py               # FastAPI app: project API + hosted web UI
+├── errors.py               # typed pipeline errors
 └── download_models.py      # verified pretrained-weight downloads
-configs/                    # classes.yaml, model.yaml, processing.yaml, pointcept/ templates
-scripts/                    # download_models.py, make_synthetic_las.py, merge_mx9_runs.py,
-│                           # train_gemini.py, calibrate_confidence.py, train_thresholds.py
+configs/                    # classes.yaml, model.yaml, processing.yaml, learned_classifier.json, pointcept/ templates
+scripts/                    # make_synthetic_las.py, merge_mx9_runs.py, download_models.py,
+│                           # train_classifier.py, train_thresholds.py, train_gemini.py,
+│                           # calibrate_confidence.py, prepare_toronto3d.py, live_sim_open3d.py
 tests/                      # full test suite incl. end-to-end, LAZ upload, and simulation paths
-docs/                       # PROCEDURE, ASSET_SCHEMA, VALIDATION, ACCURACY_REPORT, LIMITATIONS, ENHANCEMENT, MODEL_NOTES, upstream-integration
+docs/                       # PROCEDURE, UPLOADS, ACCURACY_REPORT, VALIDATION, LEARNED_CLASSIFIER,
+                            # LEARNED_MODELS, MODEL_NOTES, ALP, ASSET_SCHEMA, LIMITATIONS, ENHANCEMENT, GEMINI, upstream-integration
 ```
 
-Documentation: [`docs/PROCEDURE.md`](docs/PROCEDURE.md) (1-mile workflow),
-[`docs/GEMINI.md`](docs/GEMINI.md) (Gemini booster setup, integrity rules,
-measured impact), [`docs/ASSET_SCHEMA.md`](docs/ASSET_SCHEMA.md) (inventory
-schema & competition mapping), [`docs/ALP.md`](docs/ALP.md) (condition / action / calibrated review),
-[`docs/VALIDATION.md`](docs/VALIDATION.md) (precision/recall/F1 &
-positional-error framework), [`docs/ACCURACY_REPORT.md`](docs/ACCURACY_REPORT.md)
-(measured per-class accuracy + detector tuning), [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md)
-(known edge cases), [`docs/ENHANCEMENT.md`](docs/ENHANCEMENT.md) (roadmap).
+Documentation: [`docs/PROCEDURE.md`](docs/PROCEDURE.md) (repeatable 1-mile
+workflow incl. measured throughput), [`docs/UPLOADS.md`](docs/UPLOADS.md)
+(chunked/S3 upload contract), [`docs/ACCURACY_REPORT.md`](docs/ACCURACY_REPORT.md)
+(measured per-class accuracy + detector tuning), [`docs/VALIDATION.md`](docs/VALIDATION.md)
+(precision/recall/F1 & positional-error framework),
+[`docs/LEARNED_CLASSIFIER.md`](docs/LEARNED_CLASSIFIER.md) (trained CPU
+classifier), [`docs/LEARNED_MODELS.md`](docs/LEARNED_MODELS.md) (OpenPCSeg
+adaptation tables), [`docs/MODEL_NOTES.md`](docs/MODEL_NOTES.md) (pretrained
+weights, licensing), [`docs/ASSET_SCHEMA.md`](docs/ASSET_SCHEMA.md) (inventory
+schema & competition mapping), [`docs/ALP.md`](docs/ALP.md) (condition / action /
+calibrated review), [`docs/GEMINI.md`](docs/GEMINI.md) (Gemini booster setup,
+integrity rules, measured impact), [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md)
+(known edge cases), [`docs/ENHANCEMENT.md`](docs/ENHANCEMENT.md) (roadmap),
+[`docs/upstream-integration.md`](docs/upstream-integration.md) (what is used
+from Pointcept / RoadMarkingExtraction and what is original).
 
 ## Artifact contract
 

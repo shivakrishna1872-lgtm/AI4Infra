@@ -73,7 +73,15 @@ python -m infra_inventory tile data/mannford.las --output output/mannford/tiles 
 ```
 
 Tiles are written as LAS files (`tile_<ix>_<iy>.las`) in a single streaming pass;
-the whole cloud is never loaded into memory.
+the whole cloud is never loaded into memory. Tiling is **lossless**: every
+point lands in exactly one tile and every dimension round-trips bit-exactly
+(X/Y/Z at the source scales/offsets, intensity, RGB, NIR, GPS time, returns,
+point source, classification, scan angle, user data, scanner channel, flag
+bits, and extra-bytes dims) — verified by round-trip tests that rebuild the
+cloud from the tiles and compare every dimension per point
+(`tests/test_las_reader.py::test_tiling_is_lossless_*`). The only decimation
+in the pipeline is the browser overview cloud (`viewer_point_limit`), which is
+an LOD preview, never the inventory source.
 
 ## 6. Run inference
 
@@ -335,23 +343,28 @@ real API (upload → job → viewer payload):
 | stage | measured | note |
 | --- | ---: | --- |
 | upload (resumable chunked / simple) | **161-377 MB/s** | local disk; direct-to-S3 presign avoids the app server entirely for multi-GB files |
-| full analysis (210 k pts, 42 tiles) | **3.2 s** (~65 k pts/s) | includes SHA-256 resume check, worker-pool detection, merge passes, QC, ALP, exports; ~1.2 s is pure `process_las` |
-| per-tile detection pass | parallel across worker processes | 42 tiles over the sandbox's cores |
+| full analysis (607.5 k pts, 240 tiles) | **3.3 s** (~185 k pts/s) | includes SHA-256 resume check, worker-pool detection, merge passes, QC, ALP, exports |
+| per-tile detection pass | parallel across worker processes | 240 tiles over the sandbox's cores |
 
 Biggest recent wins (all verified identical-output before/after on the same
 file): per-asset convex-hull caching in the surface merge (hull building was
-78% of pipeline time; now cached per asset — **4.7×**), vectorized
-`_elevation_color` (**3×** on its own), fast `Asset.to_dict` (35% of export
-cost on a 1.1 M-point profile), a prefiltered nearest-highlight search for
-viewer point labels, and the streaming pass: the LAS header is now read once
-per run instead of once per chunk (laspy re-opens were O(chunks)), the
-writable tile header is built once and cached per source header instead of per
-(chunk × tile) append, and the GPS-run k-means samples to 50k points instead
-of running 40 passes over every 500k-point chunk. Streaming a 193k-point
-corridor to 40 tiles now completes in **0.44 s**. The remaining hotspots
-(point-label search, JSON export) are bounded by the viewer LOD caps
-(`viewer_point_limit`, `viewer_payload_max_bytes`), so they do not grow with
-file size.
+78% of pipeline time; now cached per asset — **4.7×**) plus a cached AABB
+precheck that skips the SAT test for far-apart pairs; vectorized
+`_elevation_color` (**3×** on its own); fast `Asset.to_dict` (35% of export
+cost on a 1.1 M-point profile); compact (non-indented) serialization of the
+big machine-consumed exports; and the streaming pass: the LAS header is now
+read once per run instead of once per chunk (laspy re-opens were O(chunks)),
+the writable tile header is built once and cached per source header instead of
+per (chunk × tile) append, per-chunk tile assignment uses a packed 1-D key
+instead of a 2-D `np.unique(..., axis=0)` (the hottest single spot on large
+files), tile files are written through one pooled writer per tile instead of
+open/append/close per chunk, and the GPS-run k-means samples to 50k points
+instead of running 40 passes over every 500k-point chunk. Streaming a
+193k-point corridor to 40 tiles completes in **0.44 s**; a 607.5k-point /
+240-tile corridor streams, detects, merges and exports in **3.3 s**. The
+remaining hotspots (point-label search, JSON export) are bounded by the
+viewer LOD caps (`viewer_point_limit`, `viewer_payload_max_bytes`), so they
+do not grow with file size.
 
 The web path deliberately raises the viewer LOD budget to 250 k points for a
 finer 3D preview; the CLI default is 120 k. Lower `viewer_point_limit` in

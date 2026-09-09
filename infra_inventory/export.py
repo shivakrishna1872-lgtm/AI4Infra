@@ -119,6 +119,7 @@ def write_outputs(
         "warnings": summary.warnings,
         "backend": summary.backend,
         "processing_version": summary.processing_version,
+        "confidence_report": summary.confidence_report,
     }
     qc_summary = {
         "total_assets": len(inventory),
@@ -127,18 +128,20 @@ def write_outputs(
     }
 
     # --- Flat inventory files ------------------------------------------------
-    (output / "assets.json").write_text(json.dumps(flat_inventory, indent=2), encoding="utf-8")
+    # Compact (no indent) on the big machine-consumed files: identical content
+    # when parsed, ~2x faster to serialize, and markedly smaller on disk.
+    (output / "assets.json").write_text(json.dumps(flat_inventory), encoding="utf-8")
     _write_csv(output / "assets.csv", inventory)
     _write_geojson(output / "assets.geojson", inventory)
     (output / "run.json").write_text(json.dumps(run, indent=2), encoding="utf-8")
     (output / "inventory.json").write_text(
-        json.dumps({"run": run, "qc": qc_summary, "inventory": flat_inventory}, indent=2), encoding="utf-8"
+        json.dumps({"run": run, "qc": qc_summary, "inventory": flat_inventory}), encoding="utf-8"
     )
 
     # --- Per-asset files ------------------------------------------------------
     for asset in inventory:
         (output / "assets" / f"{asset['asset_id']}.json").write_text(
-            json.dumps(asset, indent=2), encoding="utf-8"
+            json.dumps(asset), encoding="utf-8"
         )
 
     # --- Reports ----------------------------------------------------------------
@@ -321,6 +324,25 @@ def _summary_markdown(run: dict, inventory: List[dict], qc_report: List[dict]) -
     for condition in sorted(conditions):
         lines.append(f"| {condition} | {conditions[condition]} |")
     lines.append(f"- Sent to human review: {reviews}")
+
+    confidence = run.get("confidence_report")
+    if isinstance(confidence, dict) and confidence.get("overall_percent") is not None:
+        lines += ["", "## Overall confidence", ""]
+        lines.append(
+            f"- **{confidence['overall_percent']}% — {confidence.get('grade', '')}**"
+        )
+        lines.append("")
+        lines.append("| Component | Score | Weight |")
+        lines.append("| --- | ---: | ---: |")
+        for name, component in (confidence.get("components") or {}).items():
+            lines.append(
+                f"| {name.replace('_', ' ')} | {component.get('percent', 0)}% | {component.get('weight', 0):.0%} |"
+            )
+        lines.append("")
+        for name, component in (confidence.get("components") or {}).items():
+            detail = component.get("detail")
+            if detail:
+                lines.append(f"- **{name.replace('_', ' ')}**: {detail}")
 
     lines += ["", "## Quality control", ""]
     flagged = [entry for entry in qc_report if entry["flagged"]]

@@ -591,6 +591,9 @@ export default function Landing({ onOpen }: Props) {
                     {p.input_file ? ` · ${p.input_file}` : ""}
                     {p.point_count ? ` · ${p.point_count.toLocaleString()} pts` : ""}
                     {p.asset_count != null ? ` · ${p.asset_count} assets` : ""}
+                    {p.processed && p.confidence_percent != null
+                      ? ` · ${p.confidence_percent}% ${p.confidence_grade?.split(" ")[0] ?? ""}`
+                      : ""}
                     {p.processed ? " · processed" : " · pending"}
                   </div>
                 </button>

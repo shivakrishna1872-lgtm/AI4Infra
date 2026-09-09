@@ -307,3 +307,7 @@ class RunSummary:
     run_count: int = 0
     elapsed_seconds: float = 0.0
     processing_version: str = "0.3.0"
+    # Overall dataset-confidence report (see infra_inventory/confidence.py);
+    # populated at the end of process_las and embedded in run.json /
+    # inventory.json / viewer-data.json / the summary report.
+    confidence_report: Optional[Dict[str, Any]] = None

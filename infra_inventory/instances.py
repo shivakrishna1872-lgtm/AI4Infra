@@ -526,12 +526,24 @@ def merge_surface_fragments(
     210 k-point profile).
     """
     hull_cache: Dict[int, List[Tuple[float, float]]] = {}
+    aabb_cache: Dict[int, Tuple[float, float, float, float]] = {}
 
     def _hull_of(asset: Any) -> List[Tuple[float, float]]:
         cached = hull_cache.get(id(asset))
         if cached is None:
             cached = _xyhull_axes(asset.bounding_box, (asset.geometry or {}).get("highlight_points") or [])
             hull_cache[id(asset)] = cached
+        return cached
+
+    def _aabb_of(asset: Any) -> Tuple[float, float, float, float]:
+        """Axis-aligned bounds of the cached hull (x0, y0, x1, y1)."""
+        cached = aabb_cache.get(id(asset))
+        if cached is None:
+            hull = _hull_of(asset)
+            xs = [p[0] for p in hull]
+            ys = [p[1] for p in hull]
+            cached = (min(xs), min(ys), max(xs), max(ys))
+            aabb_cache[id(asset)] = cached
         return cached
 
     for class_name in classes:
@@ -555,6 +567,24 @@ def merge_surface_fragments(
                         continue
                     cz0, cz1 = candidate.bounding_box[2], candidate.bounding_box[5]
                     if abs(sz0 - cz0) > z_band_m and abs(sz1 - cz1) > z_band_m:
+                        continue
+                    # AABB precheck: when *every* member's box is farther than
+                    # ``proximity_m`` from the candidate's box in either axis,
+                    # the hulls are certainly separated too — skip the SAT test.
+                    # Far-apart pairs dominate the pairwise loop, and this is
+                    # O(1) per pair with cached boxes (was the SAT over every
+                    # pair, the hot spot of the merge on many-tile runs).
+                    cx0, cy0, cx1, cy1 = _aabb_of(candidate)
+                    close = False
+                    for member in group:
+                        mx0, my0, mx1, my1 = _aabb_of(member)
+                        if not (
+                            mx1 + proximity_m < cx0 or mx0 - proximity_m > cx1
+                            or my1 + proximity_m < cy0 or my0 - proximity_m > cy1
+                        ):
+                            close = True
+                            break
+                    if not close:
                         continue
                     if any(
                         _convex_polygons_within(_hull_of(member), _hull_of(candidate), proximity_m)

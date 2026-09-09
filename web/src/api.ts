@@ -336,4 +336,39 @@ export const api = {
 
   exportUrl: (projectId: string, name: string) =>
     `/api/projects/${projectId}/exports/${name}`,
+
+  downloadUrl: (projectId: string, kind: string) =>
+    `/api/projects/${projectId}/download/${kind}`,
+
+  // Fetch a processed artifact as a blob and save it locally through a
+  // generated <a download> element — no page reload, no tab navigation, and
+  // the filename comes from the server's Content-Disposition attachment.
+  async downloadExport(projectId: string, kind: string, fallbackName: string) {
+    const response = await fetch(api.downloadUrl(projectId, kind));
+    if (!response.ok) {
+      let detail = response.statusText;
+      try {
+        const body = await response.json();
+        if (body && typeof body.detail === "string") detail = body.detail;
+      } catch {
+        /* keep status text */
+      }
+      throw new Error(`${response.status}: ${detail}`);
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get("Content-Disposition") ?? "";
+    const match = disposition.match(/filename="?([^";]+)"?/i);
+    const filename = match?.[1] ?? fallbackName;
+    const url = URL.createObjectURL(blob);
+    try {
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  },
 };

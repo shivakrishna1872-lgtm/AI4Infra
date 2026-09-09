@@ -1839,3 +1839,136 @@ a {
     overflow-y: auto;
   }
 }
+
+/* ---- overall confidence card (viewer sidebar) ---- */
+.conf-card {
+  margin: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-2);
+  flex-shrink: 0;
+}
+
+.conf-top {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  cursor: pointer;
+}
+
+.conf-ring {
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+
+.conf-ring-inner {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: var(--panel-2);
+  display: grid;
+  place-items: center;
+}
+
+.conf-ring-inner b {
+  font-family: var(--mono);
+  font-size: 15px;
+}
+
+.conf-meta {
+  min-width: 0;
+}
+
+.conf-eyebrow {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  color: var(--text-faint);
+}
+
+.conf-grade {
+  font-family: var(--serif);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.conf-hint {
+  font-size: 10px;
+  color: var(--text-faint);
+  margin-top: 2px;
+}
+
+.conf-breakdown {
+  margin-top: 10px;
+  border-top: 1px solid var(--border-soft);
+  padding-top: 8px;
+}
+
+.conf-row {
+  margin-bottom: 8px;
+}
+
+.conf-row-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 11px;
+}
+
+.conf-row-label {
+  color: var(--text-dim);
+  font-weight: 600;
+}
+
+.conf-row-value {
+  font-family: var(--mono);
+  font-weight: 700;
+  font-size: 11px;
+}
+
+.conf-row-weight {
+  color: var(--text-faint);
+  font-weight: 400;
+  margin-left: 2px;
+}
+
+.conf-track {
+  height: 5px;
+  border-radius: 3px;
+  background: var(--border-soft);
+  margin-top: 3px;
+  overflow: hidden;
+}
+
+.conf-fill {
+  height: 100%;
+  border-radius: 3px;
+}
+
+.conf-detail {
+  font-size: 10px;
+  color: var(--text-faint);
+  margin-top: 3px;
+  line-height: 1.35;
+}
+
+.conf-note {
+  font-size: 10px;
+  color: var(--text-faint);
+  margin-top: 6px;
+  line-height: 1.35;
+  font-style: italic;
+}
+
+.dl-error {
+  color: var(--danger, #c14b3e);
+  font-size: 11px;
+  margin-right: 8px;
+}

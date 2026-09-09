@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import threading
 import time
@@ -274,6 +275,9 @@ class ProjectInfo(BaseModel):
     asset_count: Optional[int] = None
     scene: Optional[dict] = None
     summary: Optional[dict] = None
+    # Overall dataset confidence from the processed run (0-100 + grade).
+    confidence_percent: Optional[int] = None
+    confidence_grade: Optional[str] = None
 
 
 class ProcessRequest(BaseModel):
@@ -350,6 +354,10 @@ def _project_info(meta: dict) -> ProjectInfo:
         assets_path = output / "assets.json"
         if assets_path.is_file():
             info.asset_count = len(json.loads(assets_path.read_text(encoding="utf-8")))
+        confidence = run.get("confidence_report")
+        if isinstance(confidence, dict):
+            info.confidence_percent = confidence.get("overall_percent")
+            info.confidence_grade = confidence.get("grade")
         info.summary = meta
     info.scene = meta.get("scene")
     return info
@@ -984,6 +992,46 @@ def viewer_index(project_id: str):
     if not index.is_file():
         raise HTTPException(status_code=404, detail="No viewer built yet")
     return FileResponse(index, media_type="text/html")
+
+
+#: Download route mapping: kind -> (relative output file, media type). The
+#: browser-facing downloads go through /download/{kind} so the UI can fetch a
+#: typed blob; the raw /exports/{name} route stays for programmatic access.
+_DOWNLOADS = {
+    "json": ("assets.json", "application/json"),
+    "geojson": ("assets.geojson", "application/geo+json"),
+    "csv": ("assets.csv", "text/csv"),
+    "inventory": ("inventory.json", "application/json"),
+    "run": ("run.json", "application/json"),
+    "report": ("reports/summary.md", "text/markdown"),
+}
+
+
+@app.get("/api/projects/{project_id}/download/{kind}")
+def download_export(project_id: str, kind: str):
+    """Stream a processed artifact as an attachment download.
+
+    Explicit per-kind route (``json``, ``geojson``, ``csv``, ``inventory``,
+    ``run``, ``report``) with the correct MIME type and a
+    ``Content-Disposition: attachment`` filename so the browser always saves
+    the file instead of rendering it inline.
+    """
+    entry = _DOWNLOADS.get(kind)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Unknown download kind {kind!r}")
+    name, media = entry
+    output = _project_dir(project_id) / "output"
+    path = output / name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Export not available yet — process the project first")
+    # Friendlier filename: <project-slug>-<kind>.<ext> (fall back to the
+    # canonical artifact name when the project has no name).
+    meta = _read_project(project_id)
+    slug = re.sub(r"-+", "-", "".join(ch if ch.isalnum() else "-" for ch in (meta.get("name") or "").lower())).strip("-")
+    prefix = f"{slug or 'ai4infra'}-{kind}"
+    ext = name.rsplit(".", 1)[-1]
+    filename = f"{prefix}.{ext}"
+    return FileResponse(path, media_type=media, filename=filename)
 
 
 @app.get("/api/projects/{project_id}/exports/{name}")
