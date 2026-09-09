@@ -52,7 +52,20 @@ def _write_geojson(assets_path: Path, out_path: Path) -> dict:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_path.with_suffix(".geojson.tmp")
     tmp.write_text(json.dumps(collection, indent=2), encoding="utf-8")
-    tmp.replace(out_path)
+    # Retry on Windows/OneDrive PermissionError (WinError 5).
+    import time as _t
+    last_exc = None
+    for _attempt in range(8):
+        try:
+            import os as _os
+            _os.replace(tmp, out_path)
+            last_exc = None
+            break
+        except PermissionError as exc:
+            last_exc = exc
+            _t.sleep(0.05 * (2 ** _attempt))
+    if last_exc:
+        raise last_exc
     return collection
 
 

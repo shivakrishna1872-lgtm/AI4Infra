@@ -585,7 +585,20 @@ def _write_tile_cache(cache_dir: Path, tile_name: str, tile_assets: List[Asset],
         json.dumps({"point_count": point_count, "assets": [a.to_dict() for a in tile_assets]}),
         encoding="utf-8",
     )
-    tmp.replace(path)
+    # Retry rename on Windows/OneDrive PermissionError (WinError 5).
+    last_exc = None
+    for attempt in range(8):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            time.sleep(0.05 * (2 ** attempt))
+        except OSError:
+            raise
+    raise PermissionError(
+        f"_write_tile_cache: rename failed after 8 retries ({tmp} -> {path})"
+    ) from last_exc
 
 
 def _read_tile_cache(cache_dir: Path, tile_name: str) -> Optional[Tuple[List[Asset], int]]:

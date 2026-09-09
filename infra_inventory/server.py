@@ -62,6 +62,24 @@ def _job_file(job_id: str) -> Path:
     return DATA_DIR / "jobs" / f"{job_id}.json"
 
 
+def _safe_replace(src: Path, dst: Path, *, retries: int = 8, base_delay: float = 0.05) -> None:
+    """Retry atomic rename on Windows/OneDrive PermissionError (WinError 5)."""
+    import time as _time
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            _time.sleep(base_delay * (2 ** attempt))
+        except OSError:
+            raise
+    raise PermissionError(
+        f"_safe_replace: failed after {retries} retries ({src} -> {dst})"
+    ) from last_exc
+
+
 def _write_job(job: dict) -> None:
     """Atomically persist a job record so it survives process restarts."""
     path = _job_file(job["id"])
@@ -69,7 +87,7 @@ def _write_job(job: dict) -> None:
     tmp = path.with_suffix(".tmp")
     try:
         tmp.write_text(json.dumps(job, indent=2), encoding="utf-8")
-        tmp.replace(path)
+        _safe_replace(tmp, path)
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
@@ -329,7 +347,7 @@ def _save_project(project_id: str, meta: dict) -> None:
     # project.json behind (that made projects unreadable and requests 502/500).
     tmp = directory / "project.json.tmp"
     tmp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    tmp.replace(directory / "project.json")
+    _safe_replace(tmp, directory / "project.json")
 
 
 def _project_info(meta: dict) -> ProjectInfo:

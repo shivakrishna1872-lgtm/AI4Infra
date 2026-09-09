@@ -82,6 +82,33 @@ _LAS_SUFFIXES = (".las", ".laz")
 _LOCK = threading.Lock()
 
 
+def _safe_replace(src: Path, dst: Path, *, retries: int = 8, base_delay: float = 0.05) -> None:
+    """Atomically rename *src* to *dst* with retry on Windows/OneDrive lock errors.
+
+    On Windows (and especially on OneDrive-synced directories), ``Path.replace()``
+    can raise ``PermissionError: [WinError 5] Access is denied`` when another
+    process (the OneDrive sync daemon, an antivirus scanner, or a concurrent
+    thread that just opened the file) holds a short-lived lock on the target.
+    Retrying with exponential backoff resolves the vast majority of transient
+    conflicts without requiring any special OS configuration.
+    """
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            # Exponential backoff: 50 ms, 100 ms, 200 ms … up to ~6 s total.
+            time.sleep(base_delay * (2 ** attempt))
+        except OSError as exc:
+            # Non-permission errors (e.g. cross-device link) are not retryable.
+            raise
+    raise PermissionError(
+        f"_safe_replace: failed after {retries} retries ({src} -> {dst})"
+    ) from last_exc
+
+
 class UploadError(Exception):
     """User-facing upload error (HTTP 400/404 mapping is done by the server)."""
 
@@ -195,7 +222,7 @@ def _write_manifest(manifest: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    _safe_replace(tmp, path)
 
 
 def _validate_ids(project_id: str, upload_id: str) -> None:
@@ -386,7 +413,7 @@ def _store_part_stream(
             if not block:
                 break
             target.write(block)
-    tmp.replace(part_path)  # atomic: a half-written part is never acknowledged
+    _safe_replace(tmp, part_path)  # atomic: a half-written part is never acknowledged
 
     # Integrity gate: if a previous aborted/corrupt session reused the same
     # upload id and left a mangled part on disk, refuse to acknowledge a fresh
@@ -588,7 +615,7 @@ def complete_upload(
             "before it could corrupt the project; please retry the upload."
         ) from exc
 
-    os.replace(tmp_target, input_target)  # atomic publish
+    _safe_replace(tmp_target, input_target)  # atomic publish
     result = {
         "size": input_target.stat().st_size,
         "sha256": None,
