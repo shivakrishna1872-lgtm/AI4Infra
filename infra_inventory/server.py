@@ -31,7 +31,7 @@ import laspy
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -1145,9 +1145,55 @@ def delete_project(project_id: str) -> dict:
     return {"deleted": project_id, "freed": True}
 
 
+#: Shown at "/" when the built React UI is absent, instead of a bare 404.
+#: The bundle normally ships in the repo (web-dist/ is tracked), so this only
+#: appears after someone deletes it or builds from an old tree. Without it the
+#: API still works but "/" is an unexplained 404, which reads as "the app is
+#: broken" and pushes people to the standalone CLI viewer
+#: (`python -m infra_inventory serve`, port 8765) instead of this platform.
+_WEB_UI_SETUP_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>AI4Infra - web UI not built</title>
+<style>
+  body{font:15px/1.6 system-ui,sans-serif;background:#0b1020;color:#e6ecff;
+       margin:0;display:grid;place-items:center;min-height:100vh}
+  main{max-width:44rem;padding:2.5rem}
+  h1{font-size:1.35rem;margin:0 0 .75rem}
+  code,pre{background:#161d33;border:1px solid #2a3557;border-radius:6px}
+  code{padding:.15rem .4rem}
+  pre{padding:1rem;overflow:auto}
+  a{color:#7ea6ff}
+  .ok{color:#62e8b9}
+</style></head><body><main>
+<h1>The AI4Infra web UI is not built yet</h1>
+<p>The API is running, but <code>web-dist/</code> (the compiled browser UI) is
+missing, so there is no page to serve at <code>/</code>.</p>
+<h2>Fix it</h2>
+<p>Get the built bundle from the repository (it is tracked):</p>
+<pre>git checkout -- web-dist</pre>
+<p>Or rebuild it from source:</p>
+<pre>cd web
+npm install
+npm run build     # writes ../web-dist</pre>
+<p>Then restart this server and reload this page.</p>
+<h2>Already working</h2>
+<p class="ok">The processing API is live - try
+<a href="/docs">/docs</a> or <a href="/api/health">/api/health</a>.</p>
+<p>Note: <code>python -m infra_inventory serve output/&lt;dir&gt;</code> (port 8765)
+is a separate, lightweight point-cloud viewer for one output directory - it is
+<em>not</em> this web platform.</p>
+</main></body></html>
+"""
+
+
 # Serve the built frontend last so /api/* routes always win.
 if WEB_DIST.is_dir():
     app.mount("/", StaticFiles(directory=str(WEB_DIST), html=True), name="web")
+else:
+    @app.get("/", include_in_schema=False)
+    def _web_ui_not_built() -> HTMLResponse:
+        """Explain how to build the UI rather than returning a bare 404."""
+        return HTMLResponse(_WEB_UI_SETUP_PAGE, status_code=503)
 
 
 def main(argv: Optional[List[str]] = None) -> int:

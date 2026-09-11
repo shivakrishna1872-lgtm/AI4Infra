@@ -7,7 +7,9 @@ spatial tiles, runs geometric asset extraction (with an optional real Pointcept/
 learned backend and the specialized RoadMarkingExtraction C++ subsystem), and produces
 a structured inventory of **pavement, utilities, signs, and safety** assets — each with
 measured geometry, source-point provenance, CRS, and a transparent confidence score.
-A dependency-free 3D viewer is layered over the artifacts.
+The primary front end is a **React / Three.js 3D digital-twin web platform** served by
+the bundled FastAPI server; a dependency-free single-file 3D viewer is also shipped for
+quick inspection of one output directory from the CLI.
 
 Nothing is faked: every asset is derived from real measured signals in the input LAS,
 and every unavailable measurement is exported as `null`, never guessed.
@@ -40,11 +42,43 @@ and every unavailable measurement is exported as `null`, never guessed.
 
 ---
 
-## Quick start
+## Quick start (VS Code / fresh clone)
+
+**Run the web platform.** This is the full AI4Infra website — landing page, project
+list, upload, 3D digital twin, and every export/download. It is the front end you want.
 
 ```bash
 python -m venv .venv
+# Windows: .venv\Scripts\activate
 . .venv/bin/activate
+
+pip install -e '.[server]'     # server extra = fastapi + uvicorn (+ multipart uploads)
+python -m infra_inventory app
+```
+
+Open **http://127.0.0.1:8766**.
+
+The compiled UI (`web-dist/`) is committed, so this works on a fresh clone with no
+Node.js and no frontend build step. Then click **Quick Simulation** to generate and
+process a synthetic corridor with zero input files, or upload a `.las`/`.laz`.
+
+> **Do not confuse the two viewers.**
+> `python -m infra_inventory app` → **:8766** → the full web platform (this app).
+> `python -m infra_inventory serve output/<dir>` → **:8765** → a lightweight,
+> single-directory **point-cloud viewer** for one pipeline output. If you see a bare
+> point cloud with no landing page or asset inventory, you ran `serve` instead of `app`.
+
+### Editing the front end
+
+`web-dist/` is generated from `web/src`. After changing the React sources, rebuild:
+
+```bash
+cd web && npm install && npm run build   # writes ../web-dist; restart `app` after
+```
+
+### CLI pipeline (no browser)
+
+```bash
 pip install -e '.[dev]'
 
 # 1. Generate a synthetic test scene (TESTING ONLY - not competition data)
@@ -53,16 +87,16 @@ python -m infra_inventory demo-data --output data
 # 2. Run the full pipeline (CPU-safe, no GPU required)
 python -m infra_inventory process data/mannford_synthetic.las --output output/mannford
 
-# 3. Open the 3D viewer
-python -m infra_inventory serve output/mannford
+# 3. Optional: inspect that single output with the lightweight 3D viewer
+python -m infra_inventory serve output/mannford      # http://127.0.0.1:8765
 ```
 
-Open `http://127.0.0.1:8765`. The viewer is local and uses no CDN or cloud service.
+Every viewer is local and uses no CDN or cloud service.
 
 Verification:
 
 ```bash
-pytest -q          # 209 tests: readers, detectors, merges, uploads, LAZ, simulation, classifier, end-to-end
+pytest -q          # 218 tests: readers, detectors, merges, uploads, LAZ, simulation, classifier, end-to-end
 ```
 
 ## Simulation & demo modes

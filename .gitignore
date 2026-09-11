@@ -11,10 +11,16 @@ models/
 *.pth
 *.dxf
 
-# Runtime / build artifacts (never commit uploaded datasets or bundles)
+# Runtime / build artifacts (never commit uploaded datasets)
 appdata/
-web-dist/
 web/node_modules/
 *.tsbuildinfo
 .env*
 !.env.example
+
+# NOTE: web-dist/ (the built React/Three.js web UI) is intentionally TRACKED.
+# server.py mounts it at "/" and it is the only frontend a fresh clone gets:
+# without the bundle committed, `python -m infra_inventory app` has no route for
+# "/" and people fall back to the standalone CLI point-cloud viewer instead of
+# the real platform. Rebuild it after changing web/src:
+#     cd web && npm install && npm run build
