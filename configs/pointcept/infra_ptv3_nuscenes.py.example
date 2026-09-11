@@ -1,4 +1,4 @@
-# AI4Infra -> Pointcept PTv3 adapter config (TEMPLATE)
+# Terra Point -> Pointcept PTv3 adapter config (TEMPLATE)
 #
 # Adapt this file to your environment, save it as `infra_ptv3_nuscenes.py` and
 # pass it with --pointcept-config. It must consume the LAS tiles the pipeline
@@ -68,7 +68,7 @@ model = dict(
 )
 
 # ---------------------------------------------------------------------------
-# 4. Test: export one .npy per tile (required by the AI4Infra pipeline)
+# 4. Test: export one .npy per tile (required by the Terra Point pipeline)
 # ---------------------------------------------------------------------------
 test = dict(
     type="DefaultTester",

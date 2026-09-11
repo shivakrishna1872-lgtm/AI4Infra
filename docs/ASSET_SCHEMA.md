@@ -111,7 +111,7 @@ This document describes the on-disk schema (`assets.json`, `inventory.json`,
 ## 5. MongoDB document schema
 
 When `MONGO_URI` is set (or `--mongo-uri` passed), each asset is mirrored to
-MongoDB as one GeoJSON-aware document (`ai4infra.assets` by default; a
+MongoDB as one GeoJSON-aware document (`terra_point.assets` by default; a
 `2dsphere` index is created on `location`):
 
 ```json

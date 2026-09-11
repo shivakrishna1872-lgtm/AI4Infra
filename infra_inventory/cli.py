@@ -1,4 +1,4 @@
-"""AI4Infra command-line interface.
+"""Terra Point command-line interface.
 
 Commands:
 
@@ -85,7 +85,7 @@ def _process(args: argparse.Namespace) -> int:
         result = process_las(
             args.input, args.output, settings,
             mongo_uri=args.mongo_uri or os.environ.get("MONGO_URI"),
-            mongo_database=args.mongo_db or "ai4infra",
+            mongo_database=args.mongo_db or "terra_point",
             mongo_collection=args.mongo_collection or "assets",
         )
     except InfraError as exc:
@@ -131,7 +131,7 @@ def _serve(args: argparse.Namespace) -> int:
             pass
     handler = partial(SimpleHTTPRequestHandler, directory=str(directory))
     server = ThreadingHTTPServer((host, port), handler)
-    print(f"AI4Infra viewer: http://{host}:{port}", flush=True)
+    print(f"Terra Point viewer: http://{host}:{port}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -339,7 +339,7 @@ def _app(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="infra-inventory",
-        description="AI4Infra: auditable infrastructure asset inventory from mobile LiDAR LAS files.",
+        description="Terra Point: auditable infrastructure asset inventory from mobile LiDAR LAS files.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -378,7 +378,7 @@ def build_parser() -> argparse.ArgumentParser:
     process.add_argument("--collect-training", dest="collect_training", action="store_true",
                          help="Write labeled component features to <output>/training/ for (re)training")
     process.add_argument("--mongo-uri", help="MongoDB connection string; mirrors the inventory (or MONGO_URI env)")
-    process.add_argument("--mongo-db", default="ai4infra", help="MongoDB database (default: ai4infra)")
+    process.add_argument("--mongo-db", default="terra_point", help="MongoDB database (default: terra_point)")
     process.add_argument("--mongo-collection", default="assets", help="MongoDB collection (default: assets)")
     process.set_defaults(func=_process)
 

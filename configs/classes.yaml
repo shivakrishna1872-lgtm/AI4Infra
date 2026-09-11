@@ -1,10 +1,10 @@
-# AI4Infra asset taxonomy
+# Terra Point asset taxonomy
 #
 # Every detected object in the inventory is one of these classes. The subclass
 # refines the class. Unknown/unmeasurable attributes are exported as `null`,
 # never invented.
 #
-# The taxonomy mirrors the AI4Infra competition categories:
+# The taxonomy mirrors the Terra Point competition categories:
 #   1. Pavement  (travelled surface + painted markings)
 #   2. Utilities (poles, overhead conductors, cabinets, other)
 #   3. Signs     (panels + structures carrying them)

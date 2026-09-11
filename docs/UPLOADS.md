@@ -59,7 +59,7 @@ Activate by setting:
 | `AWS_ACCESS_KEY_ID` | `AKIA…` |
 | `AWS_SECRET_ACCESS_KEY` | `…` |
 | `AWS_REGION` | `us-east-1` |
-| `S3_BUCKET` | `ai4infra-lidar-uploads` |
+| `S3_BUCKET` | `terra-point-lidar-uploads` |
 | `S3_ENDPOINT_URL` (optional) | `https://<account>.r2.cloudflarestorage.com` for Cloudflare R2 / MinIO |
 | `S3_PRESIGN_TTL` (optional) | `3600` seconds |
 

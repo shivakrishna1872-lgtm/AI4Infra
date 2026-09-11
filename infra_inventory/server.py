@@ -1,4 +1,4 @@
-"""FastAPI server for the AI4Infra inspection platform.
+"""FastAPI server for the Terra Point inspection platform.
 
 Exposes the real pipeline over HTTP:
 
@@ -239,7 +239,7 @@ def _prune_released(now: Optional[float] = None) -> int:
 
 
 app = FastAPI(
-    title="AI4Infra",
+    title="Terra Point",
     description="AI-powered mobile LiDAR infrastructure asset extraction",
     version=__version__,
 )
@@ -1046,7 +1046,7 @@ def download_export(project_id: str, kind: str):
     # canonical artifact name when the project has no name).
     meta = _read_project(project_id)
     slug = re.sub(r"-+", "-", "".join(ch if ch.isalnum() else "-" for ch in (meta.get("name") or "").lower())).strip("-")
-    prefix = f"{slug or 'ai4infra'}-{kind}"
+    prefix = f"{slug or 'terra-point'}-{kind}"
     ext = name.rsplit(".", 1)[-1]
     filename = f"{prefix}.{ext}"
     return FileResponse(path, media_type=media, filename=filename)
@@ -1153,7 +1153,7 @@ def delete_project(project_id: str) -> dict:
 #: (`python -m infra_inventory serve`, port 8765) instead of this platform.
 _WEB_UI_SETUP_PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
-<title>AI4Infra - web UI not built</title>
+<title>Terra Point - web UI not built</title>
 <style>
   body{font:15px/1.6 system-ui,sans-serif;background:#0b1020;color:#e6ecff;
        margin:0;display:grid;place-items:center;min-height:100vh}
@@ -1165,7 +1165,7 @@ _WEB_UI_SETUP_PAGE = """<!doctype html>
   a{color:#7ea6ff}
   .ok{color:#62e8b9}
 </style></head><body><main>
-<h1>The AI4Infra web UI is not built yet</h1>
+<h1>The Terra Point web UI is not built yet</h1>
 <p>The API is running, but <code>web-dist/</code> (the compiled browser UI) is
 missing, so there is no page to serve at <code>/</code>.</p>
 <h2>Fix it</h2>
@@ -1225,11 +1225,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         except ValueError:
             pass
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"AI4Infra API: http://{host}:{port}  (data: {DATA_DIR})", flush=True)
+    print(f"Terra Point API: http://{host}:{port}  (data: {DATA_DIR})", flush=True)
     try:
         uvicorn.run(app, host=host, port=port, log_level="warning")
     except Exception as exc:  # noqa: BLE001 - last-resort crash reporter
-        print(f"AI4Infra API crashed: {exc}", file=sys.stderr, flush=True)
+        print(f"Terra Point API crashed: {exc}", file=sys.stderr, flush=True)
         return 3
     return 0
 

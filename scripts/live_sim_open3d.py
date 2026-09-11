@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Live 3D flythrough over a LAS/LAZ point cloud (desktop Open3D viewer).
 
-Optional helper for a *local* machine with a display. The AI4Infra web app has
+Optional helper for a *local* machine with a display. The Terra Point web app has
 its own browser 3D viewer + Quick Simulation, so this script is purely a
 convenience for inspecting raw clouds:
 
@@ -115,7 +115,7 @@ def main() -> int:
         print(f"Voxel-downsampled to {len(pcd.points):,} points")
 
     vis = o3d.visualization.Visualizer()
-    vis.create_window(window_name="AI4Infra live LiDAR flythrough", width=1280, height=720)
+    vis.create_window(window_name="Terra Point live LiDAR flythrough", width=1280, height=720)
     vis.add_geometry(pcd)
     if args.no_autopilot:
         vis.run()

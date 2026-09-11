@@ -1,4 +1,4 @@
-# AI4Infra processing configuration
+# Terra Point processing configuration
 #
 # Every key maps 1:1 to a field on ProcessingSettings (infra_inventory/models.py).
 # CLI flags take precedence over this file. Pass with:

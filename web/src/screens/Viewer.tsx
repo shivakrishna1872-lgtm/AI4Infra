@@ -206,7 +206,7 @@ export default function Viewer({ project, onBack }: Props) {
       {/* ---------------- top bar ---------------- */}
       <header className="topbar">
         <div className="brand">
-          <strong>AI4INFRA</strong>
+          <strong>TERRA POINT</strong>
           <span>{project.name}</span>
         </div>
         {project.simulated && <span className="sim-badge">SIM</span>}
@@ -279,7 +279,7 @@ export default function Viewer({ project, onBack }: Props) {
               setDownloadError(null);
               setDownloading(exp.kind);
               api
-                .downloadExport(project.id, exp.kind, `ai4infra-${exp.kind}.json`)
+                .downloadExport(project.id, exp.kind, `terra-point-${exp.kind}.json`)
                 .catch((err) =>
                   setDownloadError(err instanceof Error ? err.message : String(err))
                 )

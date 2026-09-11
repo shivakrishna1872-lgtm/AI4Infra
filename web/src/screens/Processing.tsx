@@ -62,7 +62,7 @@ export default function Processing({ project, jobId, onDone, onBack }: Props) {
     <div className="processing">
       <header className="landing-top">
         <div className="brand">
-          <strong>AI4INFRA</strong>
+          <strong>TERRA POINT</strong>
           <span>Processing</span>
         </div>
         <button className="btn ghost" onClick={onBack}>← Projects</button>

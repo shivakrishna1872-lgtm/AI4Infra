@@ -78,9 +78,9 @@ def run_roadmarking(
     shutil.copy2(tile_path, input_dir / f"{tile_name}.las")
 
     environment = os.environ.copy()
-    environment["AI4INFRA_TILE"] = tile_name
-    environment["AI4INFRA_INPUT_DIR"] = str(input_dir)
-    environment["AI4INFRA_OUTPUT_DIR"] = str(output_dir)
+    environment["TERRA_POINT_TILE"] = tile_name
+    environment["TERRA_POINT_INPUT_DIR"] = str(input_dir)
+    environment["TERRA_POINT_OUTPUT_DIR"] = str(output_dir)
     command_list = [command]
     if config:
         command_list.append(str(Path(config).expanduser().resolve()))

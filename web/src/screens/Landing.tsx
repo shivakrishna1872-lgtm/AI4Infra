@@ -294,7 +294,7 @@ export default function Landing({ onOpen }: Props) {
           <div className="brand">
             <span className="brand-mark" aria-hidden="true">AI</span>
             <div>
-              <strong>AI4INFRA</strong>
+              <strong>TERRA POINT</strong>
               <span className="brand-sub">LiDAR Infrastructure Intelligence</span>
             </div>
           </div>
@@ -604,7 +604,7 @@ export default function Landing({ onOpen }: Props) {
       </section>
 
       <footer className="land-foot">
-        <div>AI4INFRA · Advanced Track Asset Management Capture Model</div>
+        <div>TERRA POINT · Advanced Track Asset Management Capture Model</div>
         <div className="foot-team">Team {TEAM}</div>
         <div className="foot-meta">
           Real LiDAR processing · individual asset inventory · 3D inspection

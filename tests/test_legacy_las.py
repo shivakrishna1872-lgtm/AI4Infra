@@ -46,7 +46,7 @@ def _write_las10(path: Path, n: int = 3_000) -> None:
         0,  # project id 3
         b"\x00" * 8,  # project id 4
         1, 0,  # version 1.0
-        b"AI4Infra test".ljust(32, b"\x00"),
+        b"Terra Point test".ljust(32, b"\x00"),
         b"pytest".ljust(32, b"\x00"),
         0, 0,  # creation day/year
         227,  # header size

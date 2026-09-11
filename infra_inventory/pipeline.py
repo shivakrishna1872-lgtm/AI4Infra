@@ -857,7 +857,7 @@ def process_las(
     progress: bool = True,
     progress_callback: Optional[Callable[[dict], None]] = None,
     mongo_uri: Optional[str] = None,
-    mongo_database: str = "ai4infra",
+    mongo_database: str = "terra_point",
     mongo_collection: str = "assets",
 ) -> RunSummary:
     """Run the full pipeline: LAS -> tiling -> detection -> inventory -> exports.

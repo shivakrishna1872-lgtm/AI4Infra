@@ -1,4 +1,4 @@
-"""AI4Infra: auditable infrastructure asset inventory from mobile LiDAR.
+"""Terra Point: auditable infrastructure asset inventory from mobile LiDAR.
 
 Turn a real mobile-LiDAR LAS file into a structured infrastructure asset
 inventory (pavement, utilities, signs, safety) with measured geometry,

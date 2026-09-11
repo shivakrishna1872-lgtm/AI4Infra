@@ -48,7 +48,7 @@ Not used:
 ## Original code in this repository
 
 Everything under `infra_inventory/` (except the thin bridges above), the
-configuration files, scripts, tests, and documentation are original to AI4Infra.
+configuration files, scripts, tests, and documentation are original to Terra Point.
 This includes the streaming tile pipeline, the geometry detectors, the confidence
 engine, QC, exports, and the 3D viewer.
 

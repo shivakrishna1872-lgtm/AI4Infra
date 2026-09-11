@@ -26,7 +26,7 @@ _HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AI4Infra - Infrastructure Asset Inventory</title>
+<title>Terra Point - Infrastructure Asset Inventory</title>
 <style>
   :root {
     --bg: #070d16; --panel: #0d1624f2; --panel-solid: #0d1624; --line: #1d3048;
@@ -162,7 +162,7 @@ _HTML = """<!doctype html>
   <aside>
     <div class="side-head">
       <div class="eyebrow">Offline LiDAR inventory</div>
-      <h1>AI4Infra</h1>
+      <h1>Terra Point</h1>
       <div class="sub" id="runInfo">Loading inventory…</div>
     </div>
     <div class="metrics">

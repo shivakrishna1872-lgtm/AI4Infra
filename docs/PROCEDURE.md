@@ -1,4 +1,4 @@
-# AI4Infra Processing Procedure
+# Terra Point Processing Procedure
 
 This document is the repeatable, competition-ready procedure. Someone who has never
 seen this project must be able to follow it and process another LiDAR mile.
@@ -8,8 +8,8 @@ seen this project must be able to follow it and process another LiDAR mile.
 ## 1. Installation
 
 ```bash
-git clone <your-repo-url> ai4infra
-cd ai4infra
+git clone <your-repo-url> terra-point
+cd terra-point
 python -m venv .venv
 . .venv/bin/activate
 pip install -e '.[dev]'          # laspy, numpy, pyyaml, pytest

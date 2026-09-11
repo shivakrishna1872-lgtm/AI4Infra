@@ -25,7 +25,7 @@ so agencies can query assets spatially (a ``2dsphere`` index is created on
 Activation (all optional):
 
 * ``MONGO_URI`` env var set on the server/CLI process -> every pipeline run
-  also upserts the inventory (``MONGO_DB`` default ``ai4infra``,
+  also upserts the inventory (``MONGO_DB`` default ``terra_point``,
   ``MONGO_COLLECTION`` default ``assets``), or
 * ``--mongo-uri`` / ``--mongo-db`` / ``--mongo-collection`` on the CLI, or
 * ``scripts/export_mongo.py``-style calls against an existing output dir.
@@ -169,7 +169,7 @@ def export_to_mongo(
     inventory: List[Dict[str, Any]],
     run: Dict[str, Any],
     uri: str,
-    database: str = "ai4infra",
+    database: str = "terra_point",
     collection: str = "assets",
     replace_run: bool = True,
 ) -> Dict[str, Any]:
@@ -208,7 +208,7 @@ def export_to_mongo(
 def export_output_dir_to_mongo(
     output_dir: Any,
     uri: str,
-    database: str = "ai4infra",
+    database: str = "terra_point",
     collection: str = "assets",
 ) -> Dict[str, Any]:
     """Standalone variant: read ``assets.json`` / ``run.json`` from an output dir."""

@@ -1,4 +1,4 @@
-"""User-facing error taxonomy for AI4Infra.
+"""User-facing error taxonomy for Terra Point.
 
 Every failure mode in the pipeline raises an :class:`InfraError` subclass that
 carries a *hint* describing the likely cause and a concrete remedy, so users are
@@ -8,7 +8,7 @@ from __future__ import annotations
 
 
 class InfraError(RuntimeError):
-    """Base class for all AI4Infra failures.
+    """Base class for all Terra Point failures.
 
     Attributes:
         hint: Plain-language suggestion for resolving the failure.

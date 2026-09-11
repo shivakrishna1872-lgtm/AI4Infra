@@ -148,7 +148,7 @@ def test_export_inserts_documents_and_indexes(fake_pymongo: _FakeClient) -> None
     result = export_to_mongo(inventory, RUN, "mongodb://localhost:27017")
 
     assert result["inserted"] == 2
-    column = fake_pymongo["ai4infra"]["assets"]
+    column = fake_pymongo["terra_point"]["assets"]
     assert len(column.inserted) == 2
     assert column.inserted[0]["asset_id"] == "POL-00017"
     assert column.inserted[1]["category"] == "Signs"
@@ -162,7 +162,7 @@ def test_export_replaces_only_the_same_source_run(fake_pymongo: _FakeClient) -> 
     export_to_mongo([_asset()], RUN, "mongodb://localhost:27017")
     other = dict(RUN, input_path="/data/mannford_run2_right.las")
     export_to_mongo([_asset(asset_id="POL-00018")], other, "mongodb://localhost:27017")
-    column = fake_pymongo["ai4infra"]["assets"]
+    column = fake_pymongo["terra_point"]["assets"]
     assert column.deleted == {"source_file": other["input_path"]}
     assert len(column.inserted) == 2
 
@@ -174,7 +174,7 @@ def test_export_output_dir_roundtrip(synthetic_las: Path, output_dir: Path, fake
     process_las(synthetic_las, output_dir, ProcessingSettings(), progress=False)
     result = export_output_dir_to_mongo(output_dir, "mongodb://localhost:27017")
     assert result["inserted"] > 0
-    docs = fake_pymongo["ai4infra"]["assets"].inserted
+    docs = fake_pymongo["terra_point"]["assets"].inserted
     assert docs[0]["source_file"] == str(synthetic_las)
     for doc in docs:
         assert doc["category"] in {"Pavement", "Utilities", "Signs", "Safety"}
@@ -186,7 +186,7 @@ def test_pipeline_mirrors_inventory_when_mongo_uri_set(
     """MONGO_URI env turns the pipeline run into a mirror update, recorded as a warning."""
     calls: list = []
 
-    def fake_export(inventory, run, uri, database="ai4infra", collection="assets"):
+    def fake_export(inventory, run, uri, database="terra_point", collection="assets"):
         calls.append((len(inventory), uri))
         return {"inserted": len(inventory), "database": database, "collection": collection}
 

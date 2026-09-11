@@ -146,7 +146,7 @@ def build_scene(length_m: float, seed: int) -> tuple[list[dict], list[dict]]:
     """Run the real pipeline on a QuickSim scene; return (assets, ground_truth)."""
     from infra_inventory.simulation import run_quick_simulation
 
-    tmp = Path(tempfile.mkdtemp(prefix="ai4infra-gemini-"))
+    tmp = Path(tempfile.mkdtemp(prefix="terra-point-gemini-"))
     project = run_quick_simulation(tmp, length_m=length_m, seed=seed)
     pipeline_dir = Path(project["output_dir"]) / "pipeline"
     assets = json.loads((pipeline_dir / "assets.json").read_text())

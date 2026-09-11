@@ -148,7 +148,7 @@ def main() -> int:
     else:
         from infra_inventory.simulation import run_quick_simulation
 
-        tmp = Path(tempfile.mkdtemp(prefix="ai4infra-calibrate-"))
+        tmp = Path(tempfile.mkdtemp(prefix="terra-point-calibrate-"))
         output_dir = tmp
         print(f"Building a {args.length:.0f} m Quick Simulation scene (this runs the real pipeline)...")
         project = run_quick_simulation(tmp, length_m=args.length, seed=args.seed)

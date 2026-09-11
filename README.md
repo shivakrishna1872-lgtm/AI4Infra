@@ -1,6 +1,6 @@
-# AI4Infra
+# Terra Point
 
-**AI4Infra turns a real mobile-LiDAR LAS file into an auditable infrastructure asset inventory.**
+**Terra Point turns a real mobile-LiDAR LAS file into an auditable infrastructure asset inventory.**
 
 The pipeline is **CLI-first**: it validates and streams LAS data, splits the cloud into
 spatial tiles, runs geometric asset extraction (with an optional real Pointcept/PTv3
@@ -44,7 +44,7 @@ and every unavailable measurement is exported as `null`, never guessed.
 
 ## Quick start (VS Code / fresh clone)
 
-**Run the web platform.** This is the full AI4Infra website — landing page, project
+**Run the web platform.** This is the full Terra Point website — landing page, project
 list, upload, 3D digital twin, and every export/download. It is the front end you want.
 
 ```bash
@@ -401,7 +401,7 @@ on the server/CLI, or per run:
 
 ```bash
 python -m infra_inventory process data/mannford.las --output output/mannford \
-  --mongo-uri mongodb://localhost:27017 --mongo-db ai4infra --mongo-collection assets
+  --mongo-uri mongodb://localhost:27017 --mongo-db terra_point --mongo-collection assets
 ```
 
 Requires `pip install -e '.[mongo]'` (pymongo). The mirror is optional and
