@@ -67,6 +67,12 @@ MATCH_RADII: Dict[str, float] = {
 COMPACT = {"utility_pole", "overhead_conductor", "utility_cabinet", "traffic_sign", "rumble_strip"}
 AREA = {"guardrail", "safety_barrier", "pavement", "pavement_marking"}
 
+#: Corridor classes scored by extent-aware matching (docs/VALIDATION.md §2b):
+#: these are extracted per tile piece on purpose, so one real object yields
+#: several inventory rows matched to one GT object — per-instance precision
+#: undercounts, and recall + fragmentation are the honest measures.
+EXTENT_MATCH_CLASSES = tuple(sorted(AREA))
+
 # (setting name, [candidate values]) for the coordinate descent. Values were
 # picked around the shipped defaults; the descent only ever moves a knob when
 # the measured objective improves on the train seeds.
@@ -109,7 +115,10 @@ def measure_one(
     )
     assets = [a for a in assets if "LIKELY_DUPLICATE" not in a.get("qc_flags", [])]
     ground_truth = project["simulation_meta"]["ground_truth"]
-    result = evaluate_against_ground_truth(assets, ground_truth, match_distance_m=MATCH_RADII)
+    result = evaluate_against_ground_truth(
+        assets, ground_truth, match_distance_m=MATCH_RADII,
+        extent_match_classes=EXTENT_MATCH_CLASSES,
+    )
     return result, result["per_class"]
 
 
@@ -117,27 +126,37 @@ def measure(
     root: Path, seeds: List[int], settings: ProcessingSettings,
 ) -> Tuple[float, Dict[str, Dict[str, Any]]]:
     """Aggregate per-class counts over seeds and return (objective, per_class)."""
-    agg: Dict[str, Dict[str, int]] = {}
+    agg: Dict[str, Dict[str, Any]] = {}
     for seed in seeds:
         _, per_class = measure_one(root, seed, settings)
         for cls, m in per_class.items():
-            d = agg.setdefault(cls, {"gt": 0, "det": 0, "tp": 0, "fp": 0, "fn": 0})
+            d = agg.setdefault(cls, {"gt": 0, "det": 0, "tp": 0, "fp": 0, "fn": 0,
+                                     "matched_detections": 0})
             d["gt"] += m["ground_truth"]
             d["det"] += m["detected"]
-            d["tp"] += m["true_positives"]
-            d["fp"] += m["false_positives"]
-            d["fn"] += m["false_negatives"]
+            d["tp"] += m.get("true_positives", m.get("matched_gt", 0))
+            d["fp"] += m.get("false_positives", 0)
+            d["fn"] += m.get("false_negatives", 0)
+            d["matched_detections"] += m.get("matched_detections", 0)
     table: Dict[str, Dict[str, Any]] = {}
     for cls in sorted(agg):
         d = agg[cls]
         p = d["tp"] / d["det"] if d["det"] else 0.0
         r = d["tp"] / d["gt"] if d["gt"] else 0.0
         f = 2 * p * r / (p + r) if p + r else 0.0
-        table[cls] = {
+        row = {
             "ground_truth": d["gt"], "detected": d["det"],
             "true_positives": d["tp"], "false_positives": d["fp"], "false_negatives": d["fn"],
             "precision": round(p, 4), "recall": round(r, 4), "f1": round(f, 4),
         }
+        if cls in AREA:
+            # Extent-matched classes: recall is the score; report matched
+            # detections and fragmentation (pieces per GT object) alongside.
+            row["matched_detections"] = d["matched_detections"]
+            row["fragmentation"] = (
+                round(d["matched_detections"] / d["tp"], 2) if d["tp"] else None
+            )
+        table[cls] = row
     return _objective(table), table
 
 

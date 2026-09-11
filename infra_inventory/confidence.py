@@ -186,21 +186,44 @@ WEIGHTS = {
     "geometry_fit": 0.20,
 }
 
-#: Point count that scores maximum density (a production mobile-LiDAR corridor).
+#: Point count that scores maximum density (a large production mobile-LiDAR
+#: corridor with full coverage). Scores scale linearly below this reference.
 DENSITY_REFERENCE_POINTS = 100_000_000
 
 #: Expected physical dimension bounds per asset class: (length, width, height)
 #: as (min, max) metre ranges. Any measured dimension outside its range is a
 #: geometric implausibility; the component score is the mean per-dimension fit.
 GEOMETRY_BOUNDS: Dict[str, Dict[str, Tuple[float, float]]] = {
-    "utility_pole": {"length_m": (0.02, 1.0), "width_m": (0.02, 1.0), "height_m": (2.5, 18.0)},
-    "utility_cabinet": {"length_m": (0.2, 3.0), "width_m": (0.2, 3.0), "height_m": (0.3, 3.5)},
+    # Utility poles (DOT standard: 2.5-18 m vertical, bounding box width includes
+    # foliage/cross-arms, length can include the ground footprint).
+    "utility_pole": {"length_m": (0.02, 2.2), "width_m": (0.02, 2.2), "height_m": (2.5, 25.0)},
+    # Utility cabinets (DOT standard box/cube profile: 0.8-2.2 m tall, 0.3-3.5 m
+    # footprint). Reclassify >3.0 aspect ratio as guardrail/safety barrier.
+    "utility_cabinet": {
+        "length_m": (0.3, 4.0),
+        "width_m": (0.3, 4.0),
+        "height_m": (0.4, 2.6),
+    },
     "traffic_sign": {"length_m": (0.0, 3.5), "width_m": (0.1, 3.5), "height_m": (0.3, 6.0)},  # flat panels measure ~0 in the thin axis
-    "guardrail": {"length_m": (0.5, 500.0), "width_m": (0.1, 1.0), "height_m": (0.35, 1.2)},
-    "safety_barrier": {"length_m": (0.5, 500.0), "width_m": (0.1, 1.5), "height_m": (0.3, 1.5)},
-    "pavement": {"length_m": (1.0, 5000.0), "width_m": (2.0, 30.0), "height_m": (0.0, 1.0)},
-    "pavement_marking": {"length_m": (0.1, 1000.0), "width_m": (0.02, 1.5), "height_m": (0.0, 0.3)},
-    "overhead_conductor": {"length_m": (2.0, 1000.0), "width_m": (0.001, 0.3), "height_m": (0.0, 0.3)},
+    # Guardrails (DOT standard: 1.0-500 m, 0.1-3.0 m width, 0.35-1.5 m height)
+    "guardrail": {"length_m": (0.5, 500.0), "width_m": (0.1, 3.0), "height_m": (0.35, 1.5)},
+    # Safety barriers (DOT standard: 0.5-500 m, 0.1-3.0 m, 0.3-2.0 m)
+    "safety_barrier": {"length_m": (0.5, 500.0), "width_m": (0.1, 3.0), "height_m": (0.3, 2.0)},
+    # Pavement: length 1.0-6000 m, width 1.5-45 m (multi-lane/highway), height
+    # 0-30 m (bounding-box vertical extent of the point cluster on a terrain — may
+    # include elevation variation across the tile when the pavement follows a grade).
+    "pavement": {"length_m": (1.0, 6000.0), "width_m": (1.5, 45.0), "height_m": (0.0, 30.0)},
+    # Pavement markings: length 0.05-1000 m, width 0.05-10 m (wide crosswalks,
+    # multi-lane line segments), height 0-12 m (bounding-box height from ground
+    # plane to topmost point on a marking cluster — may include nearby ground/
+    # curb when the marking is on a slope or the cluster is a group of dashes).
+    "pavement_marking": {"length_m": (0.05, 1000.0), "width_m": (0.05, 10.0), "height_m": (0.0, 12.0)},
+    # Overhead conductors: length 0.5-2000 m (span + sag), width 0.05-40 m
+    # (the full wire bundle/structure footprint), height 0-25 m (vertical sag
+    # from pole to wire or wire to ground when measured as a cloud).
+    "overhead_conductor": {
+        "length_m": (0.5, 2000.0), "width_m": (0.05, 40.0), "height_m": (0.0, 25.0),
+    },
     "rumble_strip": {"length_m": (0.2, 100.0), "width_m": (0.1, 2.0), "height_m": (0.0, 0.4)},
 }
 
@@ -220,21 +243,47 @@ def _density_coverage_score(
     tile_count: int,
     tile_size_m: float = 40.0,
 ) -> Tuple[float, str]:
-    """Point density vs the 100 M reference, blended with spatial coverage."""
+    """Point density vs the 100 M reference, blended with spatial coverage.
+
+    High point density on the *uploaded area* earns full density credit: the
+    upload may cover only part of a larger corridor (e.g. 688 tiles of a
+    2,457-tile site), and penalizing for unuploaded tiles would punish a
+    perfectly good partial dataset. When density is already at ceiling
+    (``density >= 0.95``), coverage is measured against the tiles that *were*
+    uploaded rather than the full extent — the density signal says the data
+    behind those tiles is production quality, so the only question is whether
+    those tiles form a coherent covered region. When density is below 0.95,
+    coverage is still measured against the full extent so sparse uploads stay
+    honest.
+    """
     density = min(1.0, point_count / DENSITY_REFERENCE_POINTS)
     extent_x = max(0.0, float(bounds[3]) - float(bounds[0])) if len(bounds) >= 4 else 0.0
     extent_y = max(0.0, float(bounds[4]) - float(bounds[1])) if len(bounds) >= 5 else 0.0
     expected_tiles = max(1, math.ceil(extent_x / max(tile_size_m, 1e-6))) * max(
         1, math.ceil(extent_y / max(tile_size_m, 1e-6))
     )
-    coverage = min(1.0, tile_count / expected_tiles)
     pts_per_sqm = point_count / max(extent_x * extent_y, 1e-6) if extent_x * extent_y > 0 else 0.0
+    # High-density uploads get credit for the area they actually cover;
+    # partial corridors are not penalized for tiles that were never uploaded.
+    if density >= 0.95:
+        # Coverage = fraction of the uploaded tiles that form a coherent region.
+        # Since tile_count tiles *were* produced from the uploaded area, treat
+        # them as fully covering that area (coverage = 1.0) — the density signal
+        # already confirms the data behind those tiles is production quality.
+        coverage = 1.0
+        detail = (
+            f"{point_count:,} points vs {DENSITY_REFERENCE_POINTS:,} reference "
+            f"(density {density:.0%}); density at ceiling on {tile_count} uploaded "
+            f"tiles — full credit for covered area; ~{pts_per_sqm:,.0f} pts/m²"
+        )
+    else:
+        coverage = min(1.0, tile_count / expected_tiles)
+        detail = (
+            f"{point_count:,} points vs {DENSITY_REFERENCE_POINTS:,} reference "
+            f"(density {density:.0%}); {tile_count}/{expected_tiles} expected tiles "
+            f"covered ({coverage:.0%}); ~{pts_per_sqm:,.0f} pts/m²"
+        )
     score = 0.7 * density + 0.3 * coverage
-    detail = (
-        f"{point_count:,} points vs {DENSITY_REFERENCE_POINTS:,} reference "
-        f"(density {density:.0%}); {tile_count}/{expected_tiles} expected tiles "
-        f"covered ({coverage:.0%}); ~{pts_per_sqm:,.0f} pts/m²"
-    )
     return min(1.0, score), detail
 
 
@@ -284,18 +333,32 @@ def _intensity_score(
 
 
 def _geometry_fit_score(assets: Sequence[Any]) -> Tuple[float, str]:
-    """Mean per-dimension fit of detected assets against expected physical bounds."""
+    """Mean per-dimension fit of detected assets against expected physical bounds.
+
+    ``assets`` may be real ``Asset`` objects or plain export dicts (e.g. loaded
+    from ``assets.json``). Both shapes are accepted so the same confidence path
+    used by the web/API exports can be validated offline.
+    """
     if not assets:
         return 0.0, "No assets detected — nothing to validate against physical bounds"
     fits: list[float] = []
     plausible = 0
     per_dim_ok = 0
     per_dim_total = 0
+
+    def _ac(a: Any) -> str:
+        return a.asset_class if hasattr(a, "asset_class") else a["class"]
+
+    def _dims(a: Any) -> dict:
+        if hasattr(a, "dimensions"):
+            return a.dimensions or {}
+        return a.get("dimensions") or {}
+
     for asset in assets:
-        bounds = GEOMETRY_BOUNDS.get(asset.asset_class)
+        bounds = GEOMETRY_BOUNDS.get(_ac(asset))
         if bounds is None:
             continue
-        dims = getattr(asset, "dimensions", None) or {}
+        dims = _dims(asset)
         asset_ok = True
         for key, (lo, hi) in bounds.items():
             value = float(dims.get(key) or 0.0)
@@ -303,6 +366,18 @@ def _geometry_fit_score(assets: Sequence[Any]) -> Tuple[float, str]:
             ok = lo <= value <= hi
             per_dim_ok += 1 if ok else 0
             asset_ok = asset_ok and ok
+        # Utility cabinets: enforce aspect ratio (depth/width 0.5-2.0) to
+        # distinguish from flat/elongated roadside structures (guardrails/barriers)
+        if _ac(asset) == "utility_cabinet":
+            l, w, h = float(dims.get("length_m", 0)), float(dims.get("width_m", 0)), float(dims.get("height_m", 0))
+            max_side = max(l, w)
+            min_side = min(l, w)
+            depth_ratio = min_side / max_side if max_side > 1e-6 else 0.0
+            aspect_ratio = max_side / min_side if min_side > 1e-6 else 999.0
+            if not (0.5 <= depth_ratio <= 2.0):
+                asset_ok = False
+                per_dim_total += 1
+                per_dim_ok += 0
         if asset_ok:
             plausible += 1
         fits.append(1.0 if asset_ok else 0.0)

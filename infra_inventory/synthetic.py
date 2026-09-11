@@ -426,9 +426,21 @@ def build_simulated_las(
     parts["concrete_barrier"] = {"points": len(bxx), "note": "40 m Jersey-style barrier"}
 
     # ---- utility cabinets + rumble strips ----------------------------------------
+    # Cabinet sizes span the real DOT enclosure range (0.9-2.1 m tall), not one
+    # fixed height: a model trained only on 1.3 m boxes votes "pole" for every
+    # taller real cabinet (log_height drifts outside the training manifold).
+    # Heights/widths vary per placement; the GT table records the exact dims.
+    cab_specs = [
+        (140.0, -5.2, 0.9, 0.7, 1.3),
+        (220.0, 5.2, 1.1, 0.8, 1.7),
+    ]
+    if len(cab_specs) >= 2 and rng.random() < 0.5:
+        # Swap in a tall 2.1 m enclosure for the second cabinet half the time so
+        # both regimes appear across training seeds.
+        cab_specs[1] = (220.0, 5.2, 1.0, 0.9, 2.1)
     cab_x_all, cab_y_all, cab_z_all, cab_i_all, cab_rgb_all = [], [], [], [], []
-    for (cx0, cy0) in ((140.0, -5.2), (220.0, 5.2)):
-        cx_, cy_, cz_, ci_, crgb_ = _cabinet_mesh(cx0, cy0, 0.9, 0.7, 1.3, rng)
+    for (cx0, cy0, cw0, cd0, ch0) in cab_specs:
+        cx_, cy_, cz_, ci_, crgb_ = _cabinet_mesh(cx0, cy0, cw0, cd0, ch0, rng)
         cab_x_all.append(cx_); cab_y_all.append(cy_); cab_z_all.append(cz_)
         cab_i_all.append(ci_); cab_rgb_all.append(crgb_)
     cab_x = np.concatenate(cab_x_all); cab_y = np.concatenate(cab_y_all)
@@ -512,12 +524,12 @@ def build_simulated_las(
         "center": [360.0, 5.5, 0.4],
         "dimensions_m": [40.0, 1.4, 0.8],
     })
-    for (cx0, cy0) in ((140.0, -5.2), (220.0, 5.2)):
+    for (cx0, cy0, cw0, cd0, ch0) in cab_specs:
         ground_truth.append({
             "gt_id": f"GT-CAB-{len(ground_truth) + 1:03d}",
             "class": "utility_cabinet",
-            "center": [cx0, cy0, 0.67],
-            "dimensions_m": [0.9, 0.7, 1.3],
+            "center": [cx0, cy0, ch0 / 2 + 0.02],
+            "dimensions_m": [cw0, cd0, ch0],
         })
     ground_truth.append({
         "gt_id": f"GT-RUM-{len(ground_truth) + 1:03d}",

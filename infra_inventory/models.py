@@ -30,8 +30,8 @@ VALID_TAXONOMY: Dict[str, Tuple[Optional[str], ...]] = {
     "overhead_conductor": ("conductor",),
     "utility_cabinet": ("cabinet",),
     "traffic_sign": ("panel_with_support", "panel_only", "sign_support"),
-    "guardrail": ("roadside_barrier",),
-    "safety_barrier": ("concrete_barrier",),
+    "guardrail": ("roadside_barrier", "guardrail_segment"),
+    "safety_barrier": ("concrete_barrier", "barrier"),
     "rumble_strip": ("rumble_strip",),
 }
 
@@ -234,10 +234,12 @@ class ProcessingSettings:
     # per-tile minimums stay low and the merge pass reconstructs full spans.
     conductor_min_points: int = 15
     conductor_resolution_m: float = 0.5
-    cabinet_min_height_m: float = 0.4
-    cabinet_max_height_m: float = 3.0
+    cabinet_min_height_m: float = 0.8  # DOT standard cabinet height minimum
+    cabinet_max_height_m: float = 2.5  # max typical overhead enclosure height
     cabinet_min_side_m: float = 0.3
-    cabinet_max_side_m: float = 3.5
+    cabinet_max_side_m: float = 4.0
+    cabinet_max_side_ratio: float = 2.0  # depth/width ratio (box/cube profile)
+    cabinet_aspect_ratio_over_max: float = 3.0  # above this, reclassify as guardrail/barrier
     cabinet_min_points: int = 60
     cabinet_resolution_m: float = 0.3
 

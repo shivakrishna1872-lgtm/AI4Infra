@@ -217,7 +217,10 @@ resolved by the span-level merge, never by deletion). Current shipped model
 * **20 train seeds / 4,754 labeled components**, 800 epochs — and **11 held-out
   seeds / 2,610 components the model never saw** (fresh scenes in every round).
 * **100% accuracy on train and held-out**, all 9 classes + background at
-  P/R/F1 = 1.00.
+  P/R/F1 = 1.00 (current shipped model: train n=764 / held-out n=512 across
+  5 seeds, cabinet ground truth broadened to the full 0.9–2.1 m DOT range).
+* End-to-end objective (compact F1 + area recall, `scripts/train_thresholds.py`):
+  **1.0000 on train and held-out seeds** — every competition class at recall 1.00.
 * End-to-end pipeline on all 20 train seeds: **compact per-object F1 = 1.000**
   (poles/signs/cabinets/conductors/rumble), **area/linear recall = 1.000**
   (pavement/markings/guardrails/barriers), **2.6 detections per GT object**

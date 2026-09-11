@@ -1,6 +1,36 @@
 # Accuracy Report — detector training & validation
 
-*Last measured: this build, `scripts/train_thresholds.py` + the full pytest suite.*
+*Last measured: this build, `scripts/train_thresholds.py` + the full pytest suite (218 passed).*
+
+## 0. Latest round — measured fixes (objective 0.7778 -> 1.0000)
+
+A full re-measure of the shipped configuration against the Quick Simulation ground
+truth found three real accuracy defects (objective 7/9 = 0.7778), each fixed and
+re-verified on train AND held-out seeds:
+
+| Defect (measured) | Root cause | Fix |
+|---|---|---|
+| `utility_cabinet` recall **0.00** (6 GT, 0 detected) | the detector gated height on the *band-sliced* component: a 1.3 m cabinet sliced at 0.8–2.5 m is a 0.5 m sliver, so `height >= 0.8` rejected every real enclosure | components are now built from the **full cabinet evidence window** (above ground scatter, up to the conductor band); the height gate measures the component's true vertical extent with pole-claimed points excluded |
+| `safety_barrier` precision **0.33** (6 FPs per scene) | a sign post + panel bottom merged at grid resolution into a thin vertical remnant (~0 m long, full-height) that the cabinet aspect-rule reclassified as a barrier | degenerate vertical remnants (`max_side < 1.5 m` or taller than `barrier_max_height_m`) are dropped instead of reclassified |
+| `pavement_marking` F1 **0.00** despite 9 correct detections | the harness scored corridor classes per-object, so one 400 m GT line could match only one of the line's pieces | `train_thresholds.measure_one` now passes `extent_match_classes` exactly as docs/VALIDATION.md documents |
+
+Follow-on hardening (each verified with a targeted edge-case scene):
+
+* **Pole trunk selection under ties**: the "densest XY cell = trunk" heuristic lost
+to a cabinet whose footprint cells are denser than the shaft. Tied cells are now
+broken by *highest reach* (z-range): a cabinet top stops at ~2.5 m, a trunk does not.
+* **Cabinet size generalization**: QuickSim placed only 1.3 m cabinets, so the
+learned classifier voted "pole" for every real cabinet above ~1.6 m (log_height
+outside the training manifold). The generator now spans the DOT enclosure range
+(0.9–2.1 m with per-seed variation) and the classifier was retrained
+(`configs/learned_classifier.json`): cabinets 0.9–2.1 m all detect, including beside
+a pole line.
+* **Trained-model metrics after retraining**: train n=764 accuracy 1.000, held-out
+n=512 accuracy 1.000, macro-F1 (excl. background) 1.000, all 10 classes P/R/F1 = 1.00.
+
+Result: objective **1.0000** on train seeds (11, 23, 42) **and** held-out seeds
+(7, 5, 99) — every class at recall 1.00, compact classes at F1 1.00, area/linear
+classes with fragmentation 1.0–2.7 detections per GT object.
 
 ## 1. What "training" means in this project
 

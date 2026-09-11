@@ -9,13 +9,45 @@ property (footprint, vertical extent, linearity, density):
 """
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 
 from ..instances import component_cross_section_m, component_metrics, grid_components
 from ..models import Asset
 from .common import TileContext, build_asset
+
+
+def _true_height_in_footprint(
+    ctx: TileContext, metrics: dict, height_cap: float,
+    exclude: Optional[np.ndarray] = None,
+) -> float:
+    """Vertical extent of all tile points inside a component's XY footprint.
+
+    The cabinet detector slices a height band (cabinet_min..cabinet_max), so a
+    1.3 m cabinet's sliced component is only its top ~0.5 m — gating on the
+    *sliced* height rejects every real enclosure (measured: cabinet recall
+    0.0 on the QuickSim ground truth). The honest height is the footprint's
+    full z-extent within the cabinet evidence window: above ground scatter,
+    below the overhead-conductor band (height_cap + margin).
+
+    ``exclude`` masks points already claimed by a detected pole, so a cabinet
+    standing beside/under a pole line is not measured 2.8 m tall by the
+    trunk's lower shaft (which would push the enclosure over the height gate
+    and delete a real cabinet).
+    """
+    pad = 0.15
+    bounds = metrics["bounds"]
+    foot = (
+        (ctx.x >= bounds[0] - pad) & (ctx.x <= bounds[3] + pad)
+        & (ctx.y >= bounds[1] - pad) & (ctx.y <= bounds[4] + pad)
+    )
+    window = foot & (ctx.height > 0.12) & (ctx.height <= height_cap + 0.3)
+    if exclude is not None:
+        window &= ~exclude
+    if not window.any():
+        return float(metrics["height_m"])
+    return float(ctx.height[window].max())
 
 
 def detect_utilities(ctx: TileContext) -> List[Asset]:
@@ -35,7 +67,11 @@ def detect_utilities(ctx: TileContext) -> List[Asset]:
         if len(component) < settings.pole_min_points:
             continue
         # Densest XY cell of the component = the trunk column. Guardrail/panel
-        # neighbours sit metres away and never win the density vote.
+        # neighbours sit metres away and never win the density vote. When a
+        # cell is *tied* on density (a cabinet flush against a pole has more
+        # points in its footprint cells than the shaft), the cell reaching
+        # highest wins: a cabinet top stops at ~2.5 m, a pole trunk keeps
+        # going, so the z-range tie-break picks the shaft, not the box.
         xs = ctx.x[component]
         ys = ctx.y[component]
         res = settings.pole_resolution_m
@@ -44,7 +80,16 @@ def detect_utilities(ctx: TileContext) -> List[Asset]:
         x_cells = int(ix.max()) + 1
         keys = iy * x_cells + ix
         uniq, counts = np.unique(keys, return_counts=True)
-        best_key = uniq[int(np.argmax(counts))]
+        z_lo_cell = ctx.z[component].min()
+        z_hi_cell = ctx.z[component].max()
+        z_span_cell = max(z_hi_cell - z_lo_cell, 1e-6)
+        z_max_in_cell = np.full(len(uniq), -np.inf)
+        np.maximum.at(
+            z_max_in_cell,
+            np.searchsorted(uniq, keys),
+            (ctx.z[component] - z_lo_cell) / z_span_cell,
+        )
+        best_key = uniq[int(np.lexsort((z_max_in_cell, -counts))[0])]  # density first, then highest reach
         cell_cx = xs.min() + (best_key % x_cells + 0.5) * res
         cell_cy = ys.min() + (best_key // x_cells + 0.5) * res
         # Near-axis points: the trunk plus attachments. The densest cell's centre
@@ -146,25 +191,73 @@ def detect_utilities(ctx: TileContext) -> List[Asset]:
 
     # ---- Cabinets ---------------------------------------------------------------
     # Pole trunks masquerade as compact near-ground boxes when sliced by the
-    # height band; exclude points already claimed by a detected pole. Cabinets
-    # must also sit with their base near the ground (not float at sign height).
-    cabinet_mask = (ctx.height >= settings.cabinet_min_height_m) & (ctx.height <= settings.cabinet_max_height_m)
-    cabinet_mask &= ~pole_points
-    for component in grid_components(ctx.x, ctx.y, cabinet_mask, settings.cabinet_resolution_m, min_cells=2):
+    # height band; exclude points already claimed by a detected pole. The
+    # component is built from the *full* cabinet evidence window (above ground
+    # scatter, up to the overhead-conductor band) rather than the narrow
+    # min..max band slice: a 0.95 m cabinet sliced at 0.8-2.5 m is a 0.15 m
+    # sliver whose features look like background and got vetoed, while its
+    # full box is exactly the enclosure shape the classifier was trained on.
+    # The height gate then measures the component's true vertical extent.
+    cabinet_window = (ctx.height > 0.12) & (ctx.height <= settings.cabinet_max_height_m + 0.3)
+    cabinet_window &= ~pole_points
+    for component in grid_components(ctx.x, ctx.y, cabinet_window, settings.cabinet_resolution_m, min_cells=2):
         if len(component) < settings.cabinet_min_points:
             continue
         metrics = component_metrics(ctx.x, ctx.y, ctx.z, component)
         side_x, side_y, height = metrics["length_m"], metrics["width_m"], metrics["height_m"]
+        # Height gate uses the footprint's *full* vertical extent, not the
+        # sliced band's (a 1.3 m cabinet sliced at 0.8-2.5 m measures 0.5 m
+        # tall and would never pass a 0.8 m minimum on the sliced height).
+        # Pole-claimed points are excluded so a cabinet under a pole line is
+        # not measured 2.8 m tall by the trunk.
+        true_height = _true_height_in_footprint(
+            ctx, metrics, settings.cabinet_max_height_m, exclude=pole_points,
+        )
+        max_side = max(side_x, side_y)
+        min_side = min(side_x, side_y)
+        depth_ratio = min_side / max_side if max_side > 1e-6 else 0.0
+        aspect_ratio = max_side / min_side if min_side > 1e-6 else 999.0
+        # Strict box/cube profile: depth-to-width ratio 0.5-2.0
+        if not (settings.cabinet_max_side_ratio >= depth_ratio >= (1.0 / settings.cabinet_max_side_ratio)):
+            # Flat/elongated roadside structure -> reclassify as guardrail/barrier,
+            # but only when the candidate is genuinely linear and low. A thin
+            # vertical remnant (sign post + panel bottom merged at grid
+            # resolution: ~0 m long, ~0.9 m wide, full-height) is neither a
+            # cabinet nor a barrier and must be dropped (measured: 2 false
+            # safety_barriers per QuickSim scene from sign posts).
+            if max_side < 1.5 or true_height > settings.barrier_max_height_m:
+                continue
+            barrier_cls = "safety_barrier" if true_height > 1.0 else "guardrail"
+            explanation = (
+                f"Elongated roadside structure (aspect ratio {aspect_ratio:.1f}:1, "
+                f"depth/width ratio {depth_ratio:.2f}, {max_side:.1f} m long, "
+                f"{true_height:.2f} m tall) inconsistent with a utility cabinet; "
+                f"reclassifying as {barrier_cls}."
+            )
+            asset = build_asset(
+                ctx,
+                asset_class=barrier_cls,
+                subclass="barrier" if barrier_cls == "safety_barrier" else "guardrail_segment",  # validates against VALID_TAXONOMY
+                indices=component,
+                geometry_score=0.7,
+                explanation=explanation,
+                method="geometry-v1",
+                model_target_classes=(barrier_cls,),
+            )
+            if asset is not None:
+                assets.append(asset)
+            continue
         if (
             settings.cabinet_min_side_m <= side_x <= settings.cabinet_max_side_m
             and settings.cabinet_min_side_m <= side_y <= settings.cabinet_max_side_m
-            and settings.cabinet_min_height_m <= height <= settings.cabinet_max_height_m
+            and settings.cabinet_min_height_m <= true_height <= settings.cabinet_max_height_m
         ):
             boxiness = 1.0 - min(1.0, abs(side_x - side_y) / max(max(side_x, side_y), 1e-3))
             geometry_score = min(0.85, 0.45 + boxiness * 0.25 + min(metrics["point_count"] / 2000.0, 0.2))
             explanation = (
-                f"Compact near-ground box ({side_x:.2f} x {side_y:.2f} x {height:.2f} m) with dense "
-                "point support is consistent with a utility cabinet."
+                f"Compact near-ground box ({side_x:.2f} x {side_y:.2f} x {true_height:.2f} m, "
+                f"depth/width {depth_ratio:.2f}) with dense point support is consistent "
+                "with a utility cabinet."
             )
             asset = build_asset(
                 ctx,

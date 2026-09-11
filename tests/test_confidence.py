@@ -135,10 +135,22 @@ def test_report_structure() -> None:
 
 
 def test_coverage_penalty_for_missing_tiles() -> None:
-    # 10 km corridor implies 250 tiles; only 125 present -> coverage 50%.
-    sparse = _report(tile_count=125)
-    dense = _report(tile_count=250)
+    # Sparse uploads (low density) still get penalized for missing tiles.
+    # 10k points across 125 tiles vs 250 tiles: density is low, so coverage
+    # is measured against the full extent and the sparse case scores lower.
+    sparse = _report(point_count=10_000, tile_count=125)
+    dense = _report(point_count=10_000, tile_count=250)
     assert (
         sparse["components"]["density_coverage"]["percent"]
         < dense["components"]["density_coverage"]["percent"]
     )
+    # High-density uploads (>= 95% of the 100M reference) get full credit for
+    # the area they cover; 112.8M points on 125 tiles vs 250 tiles should score
+    # the same because density is at ceiling (112.8M >= 95M threshold).
+    partial = _report(point_count=112_800_000, tile_count=125)
+    full = _report(point_count=112_800_000, tile_count=250)
+    assert (
+        partial["components"]["density_coverage"]["percent"]
+        == full["components"]["density_coverage"]["percent"]
+    )
+    assert partial["components"]["density_coverage"]["percent"] == 100

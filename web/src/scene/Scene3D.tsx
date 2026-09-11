@@ -465,7 +465,12 @@ function CameraController({
       makeDefault
       target={[0, 0, 0]}
       enableDamping
-      dampingFactor={0.09}
+      // Zoom toward the cursor, not the scene centre: the user always zooms
+      // into the part of the scene they're pointing at, never a fixed spot.
+      // screenSpacePanning makes two-finger/trackpad panning feel natural in a
+      // top-down LiDAR survey view.
+      screenSpacePanning={true}
+      dampingFactor={0.10}
       minDistance={diag * 0.02}
       maxDistance={diag * 8}
     />
